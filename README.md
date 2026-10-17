@@ -38,8 +38,8 @@ The list is read live from the PhotoCraft README, so new apps appear automatical
 ## Quick start
 
 ```bash
-git clone https://github.com/<your-username>/<this-repo>.git
-cd <this-repo>
+git clone https://github.com/maheshmv666/ArtCraft-APK-Builder.git
+cd <ArtCraft-APK-Builder>
 python3 artcraft_apk.py
 ```
 
