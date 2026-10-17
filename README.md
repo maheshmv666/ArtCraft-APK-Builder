@@ -39,7 +39,7 @@ The list is read live from the PhotoCraft README, so new apps appear automatical
 
 ```bash
 git clone https://github.com/maheshmv666/ArtCraft-APK-Builder.git
-cd <ArtCraft-APK-Builder>
+cd ArtCraft-APK-Builder
 python3 artcraft_apk.py
 ```
 
@@ -168,8 +168,8 @@ Only JDK 17-21 with `javac`, `keytool` and `jlink` is accepted. Anything else is
 - Web app features that depend on a desktop (CLI, MCP server, local control channel) are not available in a browser build.
 - The signing key is for personal use only.
 
-## License
+##License
 
-Add your chosen license here (for example, MIT) and include a `LICENSE` file in the repository.
+This project is licensed under the MIT License. See the LICENSE file.
 
 The ArtCraft apps themselves are separate projects with their own licenses. PhotoCraft, for example, is dual-licensed under MIT or Apache-2.0. This script downloads and bundles their official release files unmodified; check each app's repository for its license and trademark terms before redistributing any APK.
