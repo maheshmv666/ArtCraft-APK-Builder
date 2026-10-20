@@ -1,36 +1,41 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-artcraft_apk.py - turn an ArtCraft web app into an offline Android APK.
+artcraft_apk.py - build NATIVE Android APKs of the ArtCraft apps from their official source code.
 
 What it does
 ------------
-  1. Reads the list of ArtCraft "Crafting Apps" (PhotoCraft, VectorCraft, ...).
+  1. Fetches the list of ArtCraft "Crafting Apps" (PhotoCraft, VectorCraft, ...).
   2. You pick one.
-  3. Finds that app's newest GitHub release that contains a web build (a *-web-*.zip),
-     downloads it and verifies its SHA-256 checksum.
-  4. Wraps the files in a tiny Android WebView app (the web files are bundled inside the
-     APK, so the app runs fully offline) and builds + signs an APK.
+  3. Finds the app's latest released version on GitHub (or its development branch with --main).
+  4. DETECTS the build tools on your computer (JDK, Android SDK + NDK, Rust, cargo-apk2). Anything
+     missing is listed, you are told what will be downloaded and where it will be saved, and only
+     then is it downloaded - into one cache folder (default: ~/.artcraft-apk).
+  5. Downloads the app's source code and compiles it to a native arm64 Android app (Rust/egui,
+     no WebView involved), signed and ready to install.
 
-Build tools (JDK 17-21, Android SDK, Gradle 8.7+) are DETECTED first. Whatever is missing
-is listed, you are told what will be downloaded and where it will be saved, and only then
-is it downloaded - into one cache folder (default: ~/.artcraft-apk).
+The compile itself is done by the MIT-licensed "artcraft-android" builder by MostafaXS1
+(https://github.com/MostafaXS1/artcraft-android), which holds the per-app Android launchers and
+patches. This script downloads that builder (pinned to a reviewed commit) and drives it; it does not
+replace it. This project is not affiliated with ArtCraft or with the builder's author.
 
-Requirements: Python 3.8+ and an internet connection (for the first run). Nothing to pip install.
+Requirements: Linux x86-64 (on Windows use WSL2), Python 3.11+, git and a C compiler/linker
+(on Debian/Ubuntu: sudo apt install git build-essential). Everything else is detected or downloaded.
 
 Examples
 --------
   python3 artcraft_apk.py                      # interactive menu
   python3 artcraft_apk.py --list               # just list the apps
   python3 artcraft_apk.py --app photocraft     # no menu
-  python3 artcraft_apk.py --app photocraft --yes --webgl
-  python3 artcraft_apk.py --app photocraft --generate-only   # write the Android project only
+  python3 artcraft_apk.py --app pdfcraft --yes
+  python3 artcraft_apk.py --app photocraft --main              # newest development code
+  python3 artcraft_apk.py --app photocraft --appname "My Editor" --packagename com.me.editor
+  python3 artcraft_apk.py --app photocraft --setup-only        # install tools + fetch source only
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import os
 import platform
 import re
@@ -43,60 +48,57 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 # --------------------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------------------
-SEED_REPO = "storytold/photocraft"  # its README holds the table of Crafting Apps
+SEED_REPO = "storytold/photocraft"  # its README has the descriptions of the Crafting Apps
 README_URL = "https://raw.githubusercontent.com/{repo}/main/README.md"
+APP_OWNER = "storytold"
 
-GRADLE_VERSION = "8.7"  # minimum Gradle for AGP 8.5
-AGP_VERSION = "8.5.2"  # Android Gradle Plugin
-COMPILE_SDK = 34
-BUILD_TOOLS = "34.0.0"
-MIN_SDK = 24  # Android 7.0
-CMDLINE_TOOLS_REV = "11076708"  # Android command-line tools build
-JDK_PREFERRED = (17, 21)  # versions we try to download, in order
-JDK_ACCEPT = range(17, 22)  # versions we accept when detecting (17..21)
-REQUIRED_SDK_PACKAGES = ["platforms;android-%d" % COMPILE_SDK, "build-tools;%s" % BUILD_TOOLS]
+# The builder that does the actual native compile (MIT licensed). Pinned to the commit that was
+# reviewed; use --builder-ref main to follow its newest changes, or --builder-path for a local copy.
+BUILDER_REPO = "MostafaXS1/artcraft-android"
+BUILDER_PIN = "07ab398456a4356744c78a598599a78ba26f5df4"
 
-FALLBACK_APPS = [
-    ("PhotoCraft", "Image editing: layers, masks, type and real PSD files", "storytold", "photocraft"),
-    ("VectorCraft", "Vector illustration", "storytold", "vectorcraft"),
-    ("FilmCraft", "Video editing, color and sound", "storytold", "filmcraft"),
-    ("LightCraft", "Photo library and raw development", "storytold", "lightcraft"),
-    ("PdfCraft", "Reading, organizing and protecting PDFs", "storytold", "pdfcraft"),
-    ("EffectCraft", "Motion graphics and visual effects", "storytold", "effectcraft"),
-    ("DesignCraft", "Page layout and publishing", "storytold", "designcraft"),
-]
+TARGET_SDK = 35
+BUILD_TOOLS = "35.0.0"
+NDK_PINNED = "27.2.12479018"
+NDK_MIN_MAJOR = 25
+CMDLINE_TOOLS_REV = "11076708"
+RUST_TARGET = "aarch64-linux-android"
+DEFAULT_MIN_RUST = "1.85"
+APK2_MIN_RUST = "1.95"  # cargo-apk2 (the APK packager) itself needs this Rust version
+JDK_PREFERRED = (17, 21)
+JDK_ACCEPT = range(17, 22)
+PLATFORM_PKG = "platforms;android-%d" % TARGET_SDK
+BUILD_TOOLS_PKG = "build-tools;%s" % BUILD_TOOLS
+NDK_PKG = "ndk;%s" % NDK_PINNED
 
-UA = "artcraft-apk/1.0"
-KEYSTORE_PASSWORD = "artcraft"  # local, personal-use signing key (not for the Play Store)
+FALLBACK_APPS = [("photocraft", "PhotoCraft"), ("vectorcraft", "VectorCraft"), ("filmcraft", "FilmCraft"),
+                 ("lightcraft", "LightCraft"), ("pdfcraft", "PdfCraft"), ("effectcraft", "EffectCraft"),
+                 ("designcraft", "DesignCraft"), ("figcraft", "FigCraft"), ("wordcraft", "WordCraft"),
+                 ("soundcraft", "SoundCraft"), ("deckcraft", "DeckCraft"), ("cadcraft", "CADCraft"),
+                 ("gridcraft", "GridCraft")]
+
+UA = "artcraft-apk/2.0"
 
 
 def _host_os() -> str:
     s = platform.system().lower()
-    if s.startswith("win"):
-        return "windows"
-    if s == "darwin":
-        return "mac"
-    return "linux"
+    return "windows" if s.startswith("win") else "mac" if s == "darwin" else "linux"
 
 
 def _host_arch() -> str:
     m = platform.machine().lower()
-    if m in ("arm64", "aarch64"):
-        return "aarch64"
-    if m in ("x86_64", "amd64"):
-        return "x64"
-    return m
+    return "aarch64" if m in ("arm64", "aarch64") else "x64" if m in ("x86_64", "amd64") else m
 
 
 OS = _host_os()
 ARCH = _host_arch()
-IS_WIN = OS == "windows"
 
 
 # --------------------------------------------------------------------------------------
@@ -131,14 +133,10 @@ def rmtree(path: Path) -> None:
         except Exception:
             pass
 
-    if path.exists():
+    if path.is_symlink():
+        path.unlink()
+    elif path.exists():
         shutil.rmtree(str(path), onerror=_onerror)
-
-
-def write(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(str(path), "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
 
 
 def confirm(question: str, assume_yes: bool) -> bool:
@@ -154,21 +152,23 @@ def confirm(question: str, assume_yes: bool) -> bool:
     return ans in ("", "y", "yes")
 
 
-# --------------------------------------------------------------------------------------
-# Networking
-# --------------------------------------------------------------------------------------
-def _request(url: str, accept: Optional[str] = None) -> urllib.request.Request:
-    headers = {"User-Agent": UA}
-    if accept:
-        headers["Accept"] = accept
-    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-    if token and urllib.parse.urlparse(url).hostname == "api.github.com":
-        headers["Authorization"] = "Bearer " + token
-    return urllib.request.Request(url, headers=headers)
+def norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", s.lower())
 
 
-def http_get(url: str, accept: Optional[str] = None, timeout: int = 30) -> bytes:
-    with urllib.request.urlopen(_request(url, accept), timeout=timeout) as r:
+def vtuple(v: str) -> Tuple[int, ...]:
+    return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
+
+
+# --------------------------------------------------------------------------------------
+# Networking, downloads, archives
+# --------------------------------------------------------------------------------------
+def _request(url: str) -> urllib.request.Request:
+    return urllib.request.Request(url, headers={"User-Agent": UA})
+
+
+def http_get(url: str, timeout: int = 30) -> bytes:
+    with urllib.request.urlopen(_request(url), timeout=timeout) as r:
         return r.read()
 
 
@@ -218,9 +218,6 @@ def download(url: str, dest: Path, label: str, sha256: Optional[str] = None) -> 
     os.replace(str(part), str(dest))
 
 
-# --------------------------------------------------------------------------------------
-# Archive extraction (path-traversal safe, keeps executable bits)
-# --------------------------------------------------------------------------------------
 def _inside(base: Path, target: Path) -> bool:
     try:
         target.resolve().relative_to(base.resolve())
@@ -252,68 +249,138 @@ def extract_tar(archive: Path, dest: Path) -> None:
         for m in members:
             if not _inside(dest, dest / m.name):
                 die("Unsafe path in archive: %s" % m.name)
-        try:
-            tf.extractall(str(dest), members=members, filter="tar")  # Python 3.12+
-        except TypeError:
-            tf.extractall(str(dest), members=members)
+        tf.extractall(str(dest), members=members, filter="tar")
 
 
 def extract(archive: Path, dest: Path) -> None:
-    if archive.name.endswith(".zip"):
-        extract_zip(archive, dest)
-    else:
-        extract_tar(archive, dest)
+    (extract_zip if archive.name.endswith(".zip") else extract_tar)(archive, dest)
 
 
 # --------------------------------------------------------------------------------------
-# Step 1: the list of apps
+# Environment checks
 # --------------------------------------------------------------------------------------
-def discover_apps() -> List[Dict[str, str]]:
-    # 1) the table in the PhotoCraft README
+def ensure_python311() -> None:
+    """The builder reads Cargo manifests with tomllib, which needs Python 3.11+."""
+    if sys.version_info >= (3, 11):
+        return
+    for name in ("python3.14", "python3.13", "python3.12", "python3.11"):
+        p = shutil.which(name)
+        if p:
+            os.execv(p, [p] + sys.argv)
+    sys.stderr.write("\nERROR: Python 3.11 or newer is required (this is %d.%d).\n"
+                     "       Debian/Ubuntu: sudo apt install python3.12   |   Fedora: sudo dnf install python3\n"
+                     % sys.version_info[:2])
+    sys.exit(1)
+
+
+def check_platform() -> None:
+    if OS == "windows":
+        die("Native Android builds need Linux. On Windows, install WSL2 (Ubuntu) and run this script there:\n"
+            "         wsl --install -d Ubuntu     (then open Ubuntu and follow the README)")
+    if OS != "linux":
+        die("The native builder is written for Linux (GNU tools, bash 4, the Linux Android NDK).\n"
+            "       macOS is not supported. Use a Linux machine, a Linux VM, or WSL2 on Windows.")
+    if ARCH != "x64":
+        die("The Android NDK only ships for x86-64 Linux, and this computer is %s. "
+            "Use an x86-64 Linux machine." % ARCH)
+
+
+def preflight() -> None:
+    """Things this script cannot install for you (they need root)."""
+    missing = []
+    if not shutil.which("git"):
+        missing.append("git")
+    if not (shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")):
+        missing.append("a C compiler/linker (cc)")
+    if not shutil.which("bash"):
+        missing.append("bash")
+    if missing:
+        die("Missing system packages: %s\n"
+            "       Debian/Ubuntu:  sudo apt install git build-essential\n"
+            "       Fedora:         sudo dnf install git gcc\n"
+            "       Arch:           sudo pacman -S git base-devel\n"
+            "       Then run this script again." % ", ".join(missing))
+
+
+def python_shim(cache: Path) -> Path:
+    """The builder calls `python3` and needs 3.11+; make sure that name points at a new enough one."""
+    d = cache / "shims"
+    d.mkdir(parents=True, exist_ok=True)
+    link = d / "python3"
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(sys.executable)
+    return d
+
+
+# --------------------------------------------------------------------------------------
+# The builder and the app list
+# --------------------------------------------------------------------------------------
+def fetch_builder(cache: Path, ref: str, local: Optional[str]) -> Tuple[Path, bool]:
+    """Returns (builder_root, is_local). Downloads the builder unless a local copy was given."""
+    if local:
+        p = Path(local).expanduser().resolve()
+        if not (p / "lib" / "build-common.sh").is_file():
+            die("--builder-path %s does not look like an artcraft-android checkout "
+                "(lib/build-common.sh is missing)." % p)
+        return p, True
+    slug = re.sub(r"[^A-Za-z0-9._-]", "_", ref)
+    dest = cache / "builder" / slug
+    immutable = re.fullmatch(r"[0-9a-f]{40}", ref) is not None
+    if not (immutable and (dest / ".complete").exists()):
+        url = "https://codeload.github.com/%s/tar.gz/%s" % (BUILDER_REPO, ref)
+        archive = cache / "downloads" / ("builder-%s.tar.gz" % slug)
+        try:
+            download(url, archive, "artcraft-android builder (%s)" % ref[:12])
+        except urllib.error.HTTPError as e:
+            die("Could not download the builder (%s): HTTP %s" % (url, e.code))
+        tmp = cache / "downloads" / ("builder-%s-tmp" % slug)
+        rmtree(tmp)
+        extract(archive, tmp)
+        archive.unlink()
+        tops = [p for p in tmp.iterdir() if p.is_dir()]
+        if len(tops) != 1 or not (tops[0] / "lib" / "build-common.sh").is_file():
+            die("The downloaded builder has an unexpected layout.")
+        rmtree(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(tops[0]), str(dest))
+        rmtree(tmp)
+        (dest / ".complete").write_text(ref + "\n")
+    return dest, False
+
+
+def builder_apps(root: Path) -> List[Tuple[str, str]]:
+    """The apps the builder can build, read from its own script."""
+    try:
+        text = (root / "lib" / "build-common.sh").read_text(errors="replace")
+    except OSError:
+        return list(FALLBACK_APPS)
+    pairs = re.findall(r'^\s*([a-z]+)\)\s*TITLE="([^"]+)"\s*;;', text, re.M)
+    return pairs or list(FALLBACK_APPS)
+
+
+def readme_descriptions() -> Dict[str, str]:
     try:
         md = http_get(README_URL.format(repo=SEED_REPO)).decode("utf-8", "replace")
-        rx = re.compile(
-            r"\*\*([^*|]+?)\*\*\s*\|\s*([^|]*?)\s*\|\s*\[GitHub\]\(https://github\.com/([^/\s)]+)/([^/\s)]+)\)")
-        apps, seen = [], set()
-        for name, desc, owner, repo in rx.findall(md):
-            if repo.lower() in seen:
-                continue
-            seen.add(repo.lower())
-            apps.append({"name": name.strip(), "desc": re.sub(r"\s*[\u00b7|-]?\s*you are here", "", desc.replace("*", "")).strip(),
-                         "owner": owner, "repo": repo})
-        if apps:
-            return apps
-    except Exception as e:
-        say("      (could not read the README app table: %s)" % e)
-    # 2) GitHub API: repos named *craft
-    try:
-        data = json.loads(http_get("https://api.github.com/users/storytold/repos?per_page=100",
-                                   "application/vnd.github+json").decode())
-        apps = []
-        for r in data:
-            n = r["name"]
-            if n.lower().endswith("craft") and not r.get("archived"):
-                apps.append({"name": n[:1].upper() + n[1:], "desc": r.get("description") or "",
-                             "owner": r["owner"]["login"], "repo": n})
-        if apps:
-            return apps
-    except Exception as e:
-        say("      (could not list repositories: %s)" % e)
-    # 3) built-in list
-    say("      Using the built-in app list.")
-    return [{"name": n, "desc": d, "owner": o, "repo": r} for n, d, o, r in FALLBACK_APPS]
+    except Exception:
+        return {}
+    rx = re.compile(r"\*\*([^*|]+?)\*\*\s*\|\s*([^|]*?)\s*\|\s*\[GitHub\]\(https://github\.com/[^/\s)]+/[^/\s)]+\)")
+    out = {}
+    for name, desc in rx.findall(md):
+        out[norm(name)] = re.sub(r"\s*[\u00b7|-]?\s*you are here", "", desc.replace("*", "")).strip()
+    return out
 
 
-def choose_app(apps: List[Dict[str, str]], wanted: Optional[str], repo_arg: Optional[str]) -> Dict[str, str]:
-    if repo_arg:
-        if "/" not in repo_arg:
-            die("--repo must look like owner/name, e.g. storytold/photocraft")
-        owner, repo = repo_arg.split("/", 1)
-        return {"name": repo[:1].upper() + repo[1:], "desc": "", "owner": owner, "repo": repo}
+def discover_apps(root: Path) -> List[Dict[str, str]]:
+    descs = readme_descriptions()
+    apps = []
+    for repo, title in builder_apps(root):
+        apps.append({"name": title, "repo": repo, "owner": APP_OWNER,
+                     "desc": descs.get(norm(title), descs.get(repo, ""))})
+    return apps
 
-    def norm(s: str) -> str:
-        return re.sub(r"[^a-z0-9]", "", s.lower())
 
+def choose_app(apps: List[Dict[str, str]], wanted: Optional[str]) -> Dict[str, str]:
     if wanted:
         if wanted.isdigit() and 1 <= int(wanted) <= len(apps):
             return apps[int(wanted) - 1]
@@ -325,12 +392,11 @@ def choose_app(apps: List[Dict[str, str]], wanted: Optional[str], repo_arg: Opti
             if w and (norm(a["name"]).startswith(w) or norm(a["repo"]).startswith(w)):
                 return a
         die("No app matches '%s'. Run with --list to see the choices." % wanted)
-
     if not sys.stdin.isatty():
         die("No terminal available to ask which app to build. Pass --app NAME (see --list).")
     say("\n    Available ArtCraft apps:")
     for i, a in enumerate(apps, 1):
-        say("      %d) %-12s %s" % (i, a["name"], a["desc"]))
+        say("      %2d) %-12s %s" % (i, a["name"], a["desc"]))
     while True:
         try:
             ans = input("\n    Choose an app [1-%d]: " % len(apps)).strip()
@@ -342,105 +408,49 @@ def choose_app(apps: List[Dict[str, str]], wanted: Optional[str], repo_arg: Opti
 
 
 # --------------------------------------------------------------------------------------
-# Step 3: newest release that contains a web build
+# Latest version of an app
 # --------------------------------------------------------------------------------------
-def is_web_zip(name: str) -> bool:
-    n = name.lower()
-    return n.endswith(".zip") and "web" in n and "sha" not in n
+def git_tags(owner: str, repo: str) -> List[str]:
+    """Release tags, read with `git ls-remote` (no API, so no rate limit)."""
+    r = subprocess.run(["git", "ls-remote", "--tags", "--refs", "https://github.com/%s/%s" % (owner, repo)],
+                       capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        die("Could not list versions of %s/%s:\n%s" % (owner, repo, (r.stderr or "").strip()))
+    return [line.split("refs/tags/", 1)[1].strip() for line in r.stdout.splitlines() if "refs/tags/" in line]
 
 
-def release_via_api(owner: str, repo: str) -> Optional[Dict]:
-    url = "https://api.github.com/repos/%s/%s/releases?per_page=20" % (owner, repo)
-    data = json.loads(http_get(url, "application/vnd.github+json").decode())
-    for rel in data:
-        if rel.get("draft"):
-            continue
-        assets = rel.get("assets", [])
-        zips = [a for a in assets if is_web_zip(a["name"])]
-        if not zips:
-            continue
-        sums = [a for a in assets if a["name"].lower().startswith("sha256sums")]
-        return {"tag": rel["tag_name"], "prerelease": bool(rel.get("prerelease")),
-                "name": zips[0]["name"], "url": zips[0]["browser_download_url"],
-                "size": zips[0].get("size", 0),
-                "sums_url": sums[0]["browser_download_url"] if sums else None}
-    return None
+def latest_version(owner: str, repo: str) -> Optional[str]:
+    """Newest stable release tag; a pre-release (-rc, -beta ...) is used only if there is no stable one."""
+    stable, pre = [], []
+    for t in git_tags(owner, repo):
+        m = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)(.*)", t)
+        if m:
+            key = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            (pre if m.group(4) else stable).append((key, t))
+    pool = stable or pre
+    return max(pool)[1] if pool else None
 
 
-def release_via_html(owner: str, repo: str) -> Optional[Dict]:
-    """API-free fallback (the API allows only 60 anonymous requests/hour per IP)."""
-    base = "https://github.com/%s/%s" % (owner, repo)
-    atom = http_get(base + "/releases.atom").decode("utf-8", "replace")
-    tags: List[str] = []
-    for t in re.findall(r'/releases/tag/([^"<\s]+)"', atom):
-        if t not in tags:
-            tags.append(t)
-    for tag in tags[:10]:
-        try:
-            html = http_get("%s/releases/expanded_assets/%s" % (base, tag)).decode("utf-8", "replace")
-        except Exception:
-            continue
-        hrefs = re.findall(r'href="([^"]*/releases/download/[^"]+)"', html)
-        zips = [h for h in hrefs if is_web_zip(urllib.parse.unquote(h.rsplit("/", 1)[-1]))]
-        if not zips:
-            continue
-        sums = [h for h in hrefs if h.rsplit("/", 1)[-1].lower().startswith("sha256sums")]
-        full = lambda h: h if h.startswith("http") else "https://github.com" + h
-        return {"tag": urllib.parse.unquote(tag), "prerelease": False,
-                "name": urllib.parse.unquote(zips[0].rsplit("/", 1)[-1]), "url": full(zips[0]),
-                "size": 0, "sums_url": full(sums[0]) if sums else None}
-    return None
-
-
-def find_web_release(app: Dict[str, str]) -> Dict:
-    owner, repo = app["owner"], app["repo"]
-    rel = None
+def min_rust_version(owner: str, repo: str, ref: Optional[str]) -> str:
+    url = "https://raw.githubusercontent.com/%s/%s/%s/Cargo.toml" % (owner, repo, ref or "HEAD")
     try:
-        rel = release_via_api(owner, repo)
-        if rel is None:
-            die("%s has no release that contains a web build (no *-web-*.zip file found).\n"
-                "       Only apps that publish a web build can be wrapped by this tool.\n"
-                "       See https://github.com/%s/%s/releases" % (app["name"], owner, repo))
-    except urllib.error.HTTPError as e:
-        why = "GitHub API rate limit reached" if e.code in (403, 429) else "GitHub API error %s" % e.code
-        say("      (%s - trying without the API)" % why)
-    except SystemExit:
-        raise
-    except Exception as e:
-        say("      (GitHub API not reachable: %s - trying without the API)" % e)
-    if rel is None:
-        try:
-            rel = release_via_html(owner, repo)
-        except Exception as e:
-            die("Could not look up releases for %s/%s: %s" % (owner, repo, e))
-        if rel is None:
-            die("%s has no release that contains a web build (no *-web-*.zip file found)." % app["name"])
-    sha = None
-    if rel.get("sums_url"):
-        try:
-            text = http_get(rel["sums_url"]).decode("utf-8", "replace")
-            for line in text.splitlines():
-                m = re.match(r"^([0-9a-fA-F]{64})\s+\*?(.+?)\s*$", line)
-                if m and m.group(2).strip() == rel["name"]:
-                    sha = m.group(1)
-        except Exception:
-            pass
-    rel["sha256"] = sha
-    rel["version"] = rel["tag"].lstrip("vV")
-    return rel
+        m = re.search(r'^\s*rust-version\s*=\s*"(\d+\.\d+(?:\.\d+)?)"', http_get(url).decode("utf-8", "replace"), re.M)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return DEFAULT_MIN_RUST
 
 
 # --------------------------------------------------------------------------------------
-# Step 4: detect / install build tools
+# Tool detection
 # --------------------------------------------------------------------------------------
 def _bin(home: Path, name: str, kind: str = "exe") -> Path:
-    suffix = (".exe" if kind == "exe" else ".bat") if IS_WIN else ""
-    return home / "bin" / (name + suffix)
+    return home / "bin" / name
 
 
 def java_major(home: Path) -> Optional[int]:
-    # AGP (compileSdk 34) also runs jlink from the JDK, and some bundled JDKs lack it.
-    for tool in ("java", "javac", "keytool", "jlink"):
+    for tool in ("java", "javac", "keytool"):
         if not _bin(home, tool).exists():
             return None
     try:
@@ -470,8 +480,8 @@ def java_home_from_path() -> Optional[Path]:
 def find_java_under(root: Path) -> Optional[Path]:
     if not root.exists():
         return None
-    for depth_glob in ("*", "*/*", "*/*/*"):
-        for p in sorted(root.glob(depth_glob)):
+    for g in ("*", "*/*", "*/*/*"):
+        for p in sorted(root.glob(g)):
             if p.is_dir() and _bin(p, "java").exists():
                 return p
     return None
@@ -485,17 +495,8 @@ def find_java(cache: Path) -> Tuple[Optional[Path], Optional[int]]:
     if p:
         cands.append(p)
     home = Path.home()
-    if OS == "linux":
-        cands += [Path("/opt/android-studio/jbr"), Path("/usr/local/android-studio/jbr"),
-                  home / "android-studio" / "jbr", Path("/snap/android-studio/current/android-studio/jbr")]
-    elif OS == "mac":
-        cands += [Path("/Applications/Android Studio.app/Contents/jbr/Contents/Home")]
-    else:
-        for env in ("ProgramFiles", "LOCALAPPDATA"):
-            if os.environ.get(env):
-                cands.append(Path(os.environ[env]) / "Android" / "Android Studio" / "jbr")
-        if os.environ.get("LOCALAPPDATA"):
-            cands.append(Path(os.environ["LOCALAPPDATA"]) / "Programs" / "Android Studio" / "jbr")
+    cands += [Path("/opt/android-studio/jbr"), Path("/usr/local/android-studio/jbr"),
+              home / "android-studio" / "jbr", Path("/snap/android-studio/current/android-studio/jbr")]
     cached = find_java_under(cache / "jdk")
     if cached:
         cands.append(cached)
@@ -511,20 +512,66 @@ def find_java(cache: Path) -> Tuple[Optional[Path], Optional[int]]:
 
 
 def find_sdkmanager(sdk: Path) -> Optional[Path]:
-    latest = _bin(sdk / "cmdline-tools" / "latest", "sdkmanager", "bat")
+    latest = sdk / "cmdline-tools" / "latest" / "bin" / "sdkmanager"
     if latest.exists():
         return latest
-    for p in sorted((sdk / "cmdline-tools").glob("*")) if (sdk / "cmdline-tools").exists() else []:
-        c = _bin(p, "sdkmanager", "bat")
-        if c.exists():
-            return c
+    base = sdk / "cmdline-tools"
+    if base.exists():
+        for p in sorted(base.glob("*")):
+            c = p / "bin" / "sdkmanager"
+            if c.exists():
+                return c
     return None
 
 
+def ndk_major(p: Path) -> Optional[int]:
+    try:
+        for line in (p / "source.properties").read_text().splitlines():
+            if line.startswith("Pkg.Revision"):
+                return int(line.split("=", 1)[1].strip().split(".")[0])
+    except Exception:
+        pass
+    m = re.match(r"(\d+)\.", p.name)
+    return int(m.group(1)) if m else None
+
+
+def ndk_ok(p: Path) -> bool:
+    return (p / "toolchains" / "llvm" / "prebuilt").is_dir() and (ndk_major(p) or 0) >= NDK_MIN_MAJOR
+
+
+def find_ndk(sdk: Optional[Path]) -> Optional[Path]:
+    for v in ("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "NDK_HOME"):
+        if os.environ.get(v) and ndk_ok(Path(os.environ[v])):
+            return Path(os.environ[v])
+    if sdk and (sdk / "ndk").is_dir():
+        pinned = sdk / "ndk" / NDK_PINNED
+        if ndk_ok(pinned):
+            return pinned
+        found = [d for d in (sdk / "ndk").glob("*") if d.is_dir() and ndk_ok(d)]
+        found.sort(key=lambda d: [int(x) if x.isdigit() else 0 for x in re.split(r"[.\-]", d.name)])
+        if found:
+            return found[-1]
+    return None
+
+
+@dataclass
 class SdkPlan:
-    def __init__(self, path: Path, missing: List[str], need_cmdline: bool, private: bool, existing: bool):
-        self.path, self.missing, self.need_cmdline = path, missing, need_cmdline
-        self.private, self.existing = private, existing
+    path: Path
+    missing: List[str]
+    need_cmdline: bool
+    private: bool
+    existing: bool
+
+
+def sdk_missing(sdk: Path) -> List[str]:
+    miss = []
+    if not (sdk / "platforms" / ("android-%d" % TARGET_SDK)).is_dir():
+        miss.append(PLATFORM_PKG)
+    if not (sdk / "build-tools" / BUILD_TOOLS).is_dir():
+        miss.append(BUILD_TOOLS_PKG)
+    if find_ndk(sdk) is None:
+        miss.append(NDK_PKG)
+    return miss
 
 
 def plan_sdk(cache: Path) -> SdkPlan:
@@ -533,79 +580,117 @@ def plan_sdk(cache: Path) -> SdkPlan:
         if os.environ.get(v):
             cands.append(Path(os.environ[v]))
     home = Path.home()
-    if OS == "linux":
-        cands += [home / "Android" / "Sdk", home / "Android" / "sdk"]
-    elif OS == "mac":
-        cands += [home / "Library" / "Android" / "sdk"]
-    elif os.environ.get("LOCALAPPDATA"):
-        cands += [Path(os.environ["LOCALAPPDATA"]) / "Android" / "Sdk"]
-    cands.append(cache / "android-sdk")
+    cands += [home / "Android" / "Sdk", home / "Android" / "sdk", cache / "android-sdk"]
     seen, usable = set(), []
     for c in cands:
         if str(c) not in seen and c.is_dir():
             seen.add(str(c))
             usable.append(c)
+    private = cache / "android-sdk"
     partial = None
     for sdk in usable:
-        missing = [p for p in REQUIRED_SDK_PACKAGES if not (sdk / p.replace(";", "/")).is_dir()]
+        missing = sdk_missing(sdk)
         if not missing:
-            return SdkPlan(sdk, [], False, sdk == cache / "android-sdk", True)
+            return SdkPlan(sdk, [], False, sdk == private, True)
         if partial is None and find_sdkmanager(sdk) and os.access(str(sdk), os.W_OK):
             partial = (sdk, missing)
     if partial:
-        return SdkPlan(partial[0], partial[1], False, partial[0] == cache / "android-sdk", True)
-    private = cache / "android-sdk"
-    return SdkPlan(private, list(REQUIRED_SDK_PACKAGES), find_sdkmanager(private) is None, True, private.is_dir())
+        return SdkPlan(partial[0], partial[1], False, partial[0] == private, True)
+    return SdkPlan(private, sdk_missing(private), find_sdkmanager(private) is None, True, private.is_dir())
 
 
-def gradle_ok(gradle: Path, env: Dict[str, str]) -> bool:
-    try:
-        out = subprocess.run([str(gradle), "--version"], capture_output=True, text=True, timeout=120, env=env)
-    except Exception:
-        return False
-    m = re.search(r"Gradle (\d+)\.(\d+)", out.stdout or "")
-    if not m:
-        return False
-    major, minor = int(m.group(1)), int(m.group(2))
-    need_major, need_minor = [int(x) for x in GRADLE_VERSION.split(".")[:2]]
-    return major == need_major and minor >= need_minor
+# ---- Rust -------------------------------------------------------------------------------
+@dataclass
+class RustSetup:
+    action: str = "ok"  # ok | install | update
+    private: bool = False
+    rustup: Optional[Path] = None
+    env: Dict[str, str] = field(default_factory=dict)  # CARGO_HOME / RUSTUP_HOME overrides
+    bin_dirs: List[Path] = field(default_factory=list)
+    version: Optional[str] = None
 
 
-def find_gradle(cache: Path, env: Dict[str, str]) -> Optional[Path]:
-    cached = _bin(cache / "gradle" / ("gradle-" + GRADLE_VERSION), "gradle", "bat")
-    if cached.exists():
-        return cached
-    sysg = shutil.which("gradle")
-    if sysg and gradle_ok(Path(sysg), env):
-        return Path(sysg)
-    return None
-
-
-def gradle_user_home() -> Path:
-    return Path(os.environ.get("GRADLE_USER_HOME") or (Path.home() / ".gradle"))
-
-
-def agp_cached() -> bool:
-    return (gradle_user_home() / "caches" / "modules-2" / "files-2.1" / "com.android.tools.build" /
-            "gradle" / AGP_VERSION).is_dir()
-
-
-def make_env(java_home: Path, sdk: Optional[Path]) -> Dict[str, str]:
+def _rust_env(over: Dict[str, str]) -> Dict[str, str]:
     env = os.environ.copy()
-    env["JAVA_HOME"] = str(java_home)
-    env["PATH"] = str(java_home / "bin") + os.pathsep + env.get("PATH", "")
-    if sdk:
-        env["ANDROID_HOME"] = env["ANDROID_SDK_ROOT"] = str(sdk)
+    env.update(over)
+    env.pop("RUSTUP_TOOLCHAIN", None)
     return env
 
 
+def stable_status(rustup: Path, over: Dict[str, str]) -> Tuple[Optional[str], bool]:
+    """(version of the 'stable' toolchain or None, whether it has the Android target)."""
+    env = _rust_env(over)
+    try:
+        r = subprocess.run([str(rustup), "run", "stable", "rustc", "--version"], capture_output=True,
+                           text=True, timeout=120, env=env)
+        if r.returncode != 0:
+            return None, False
+        m = re.search(r"rustc (\d+\.\d+\.\d+)", r.stdout)
+        t = subprocess.run([str(rustup), "target", "list", "--installed", "--toolchain", "stable"],
+                           capture_output=True, text=True, timeout=120, env=env)
+    except Exception:
+        return None, False
+    return (m.group(1) if m else None), RUST_TARGET in (t.stdout or "").split()
+
+
+def private_rust_paths(cache: Path) -> Tuple[Path, Path]:
+    return cache / "rust" / "cargo", cache / "rust" / "rustup"
+
+
+def plan_rust(cache: Path, min_ver: str) -> RustSetup:
+    cargo_home, rustup_home = private_rust_paths(cache)
+    cands: List[RustSetup] = []
+    ru = shutil.which("rustup")
+    if not ru:
+        p = Path(os.environ.get("CARGO_HOME") or (Path.home() / ".cargo")) / "bin" / "rustup"
+        ru = str(p) if p.exists() else None
+    if ru:
+        cands.append(RustSetup("ok", False, Path(ru), {}, [Path(ru).parent]))
+    priv_ru = cargo_home / "bin" / "rustup"
+    priv_env = {"CARGO_HOME": str(cargo_home), "RUSTUP_HOME": str(rustup_home)}
+    if priv_ru.exists():
+        cands.append(RustSetup("ok", True, priv_ru, priv_env, [cargo_home / "bin"]))
+    for c in cands:
+        ver, has_target = stable_status(c.rustup, c.env)  # type: ignore[arg-type]
+        if ver and vtuple(ver) >= vtuple(min_ver) and has_target:
+            c.version = ver
+            return c
+    # Nothing usable. We never modify your own Rust setup: everything goes into the cache.
+    return RustSetup("update" if priv_ru.exists() else "install", True,
+                     priv_ru if priv_ru.exists() else None, priv_env, [cargo_home / "bin"])
+
+
+def tool_env(rust: RustSetup, cache: Path, extra_path: Optional[List[Path]] = None) -> Dict[str, str]:
+    env = os.environ.copy()
+    env.update(rust.env)
+    env["RUSTUP_TOOLCHAIN"] = "stable"
+    paths = list(extra_path or []) + list(rust.bin_dirs) + [cache / "cargo-tools" / "bin"]
+    env["PATH"] = os.pathsep.join(str(p) for p in paths) + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def apk2_present(rust: RustSetup, cache: Path) -> bool:
+    if (cache / "cargo-tools" / "bin" / "cargo-apk2").exists():
+        return True
+    if rust.action != "ok":
+        return False
+    try:
+        r = subprocess.run(["cargo", "apk2", "--help"], capture_output=True, text=True, timeout=60,
+                           env=tool_env(rust, cache))
+    except Exception:
+        return False
+    return r.returncode == 0
+
+
+# --------------------------------------------------------------------------------------
+# Installers
+# --------------------------------------------------------------------------------------
 def install_jdk(cache: Path) -> Path:
     dest = cache / "jdk"
-    ext = "zip" if IS_WIN else "tar.gz"
     last_err = None
     for feat in JDK_PREFERRED:
-        url = "https://api.adoptium.net/v3/binary/latest/%d/ga/%s/%s/jdk/hotspot/normal/eclipse" % (feat, OS, ARCH)
-        archive = cache / "downloads" / ("jdk-%d.%s" % (feat, ext))
+        url = "https://api.adoptium.net/v3/binary/latest/%d/ga/linux/x64/jdk/hotspot/normal/eclipse" % feat
+        archive = cache / "downloads" / ("jdk-%d.tar.gz" % feat)
         try:
             download(url, archive, "JDK %d" % feat)
         except urllib.error.HTTPError as e:
@@ -618,41 +703,15 @@ def install_jdk(cache: Path) -> Path:
         if home and java_major(home):
             return home
         die("The downloaded JDK could not be used (%s)." % dest)
-    die("Could not download a JDK for %s/%s (%s). Install JDK 17 yourself and set JAVA_HOME." % (OS, ARCH, last_err))
-    raise AssertionError  # unreachable
-
-
-def install_gradle(cache: Path) -> Path:
-    base = "https://services.gradle.org/distributions/gradle-%s-bin.zip" % GRADLE_VERSION
-    sha = None
-    try:
-        sha = http_get(base + ".sha256").decode().split()[0]
-    except Exception:
-        say("      (checksum for Gradle not available - continuing without verification)")
-    archive = cache / "downloads" / ("gradle-%s-bin.zip" % GRADLE_VERSION)
-    download(base, archive, "Gradle %s" % GRADLE_VERSION, sha)
-    dest = cache / "gradle"
-    rmtree(dest / ("gradle-" + GRADLE_VERSION))
-    extract(archive, dest)
-    archive.unlink()
-    g = _bin(dest / ("gradle-" + GRADLE_VERSION), "gradle", "bat")
-    if not g.exists():
-        die("Gradle was downloaded but %s is missing." % g)
-    if not IS_WIN:
-        g.chmod(0o755)
-    return g
-
-
-def _tail(text: str, n: int = 25) -> str:
-    return "\n".join((text or "").strip().splitlines()[-n:])
+    die("Could not download a JDK (%s). Install JDK 17 yourself and set JAVA_HOME." % last_err)
+    raise AssertionError
 
 
 def install_sdk(plan: SdkPlan, cache: Path, java_home: Path) -> None:
     sdk = plan.path
     sdk.mkdir(parents=True, exist_ok=True)
     if plan.need_cmdline:
-        key = {"linux": "linux", "mac": "mac", "windows": "win"}[OS]
-        url = "https://dl.google.com/android/repository/commandlinetools-%s-%s_latest.zip" % (key, CMDLINE_TOOLS_REV)
+        url = "https://dl.google.com/android/repository/commandlinetools-linux-%s_latest.zip" % CMDLINE_TOOLS_REV
         archive = cache / "downloads" / "cmdline-tools.zip"
         download(url, archive, "Android command-line tools")
         tmp = cache / "downloads" / "cmdline-tools-tmp"
@@ -667,900 +726,370 @@ def install_sdk(plan: SdkPlan, cache: Path, java_home: Path) -> None:
     sm = find_sdkmanager(sdk)
     if not sm:
         die("sdkmanager not found in %s" % sdk)
-    env = make_env(java_home, sdk)
+    env = os.environ.copy()
+    env["JAVA_HOME"] = str(java_home)
+    env["PATH"] = str(java_home / "bin") + os.pathsep + env.get("PATH", "")
     say("      Accepting Android SDK licenses ...")
     subprocess.run([str(sm), "--sdk_root=%s" % sdk, "--licenses"], input="y\n" * 80, text=True,
                    capture_output=True, env=env)
     if plan.missing:
-        say("      Installing %s (this can take a few minutes) ..." % ", ".join(plan.missing))
-        r = subprocess.run([str(sm), "--sdk_root=%s" % sdk] + plan.missing, input="y\n" * 10, text=True,
-                           capture_output=True, env=env)
+        say("      Installing %s (the NDK is large - this can take a while) ..." % ", ".join(plan.missing))
+        r = subprocess.run([str(sm), "--sdk_root=%s" % sdk] + plan.missing, input="y\n" * 10, text=True, env=env)
+        if r.returncode != 0 and NDK_PKG in plan.missing:
+            # The pinned NDK id may be unavailable: pick the newest NDK of the same major version instead.
+            lst = subprocess.run([str(sm), "--sdk_root=%s" % sdk, "--list"], text=True, capture_output=True, env=env)
+            vers = re.findall(r"ndk;(%s\.[0-9.]+)" % NDK_PINNED.split(".")[0], lst.stdout or "")
+            if vers:
+                best = max(vers, key=lambda v: [int(x) for x in v.split(".")])
+                say("      Retrying with NDK %s ..." % best)
+                r = subprocess.run([str(sm), "--sdk_root=%s" % sdk] + [p for p in plan.missing if p != NDK_PKG]
+                                   + ["ndk;" + best], input="y\n" * 10, text=True, env=env)
         if r.returncode != 0:
-            die("sdkmanager failed:\n%s\n\nCheck your internet connection / proxy and try again."
-                % _tail((r.stdout or "") + (r.stderr or "")))
-    left = [p for p in REQUIRED_SDK_PACKAGES if not (sdk / p.replace(";", "/")).is_dir()]
+            die("sdkmanager failed (see the output above). Check your internet connection / proxy and try again.")
+    left = sdk_missing(sdk)
     if left:
         die("Android SDK packages are still missing after install: %s" % ", ".join(left))
 
 
-def ensure_keystore(cache: Path, java_home: Path) -> Path:
-    ks = cache / "signing" / "artcraft-release.keystore"
-    if ks.exists():
-        return ks
-    ks.parent.mkdir(parents=True, exist_ok=True)
-    r = subprocess.run([str(_bin(java_home, "keytool")), "-genkeypair", "-keystore", str(ks),
-                        "-storepass", KEYSTORE_PASSWORD, "-keypass", KEYSTORE_PASSWORD, "-alias", "artcraft",
-                        "-keyalg", "RSA", "-keysize", "2048", "-validity", "10000",
-                        "-dname", "CN=ArtCraft APK Builder, O=Local"], capture_output=True, text=True)
-    if r.returncode != 0:
-        die("Could not create the signing key:\n%s" % _tail(r.stdout + r.stderr))
-    say("      Created a signing key: %s" % ks)
-    say("      (Keep it: APKs signed with the same key can be installed over each other as updates.)")
-    return ks
-
-
-# --------------------------------------------------------------------------------------
-# Step 5/6: Android project
-# --------------------------------------------------------------------------------------
-HOOK_JS = r"""(function () {
-  if (window.__acHook) return;
-  var B = window.AndroidBridge;
-  if (!B) return;
-  window.__acHook = true;
-
-  // Saves blob:/data: downloads (what web apps use for "Save"/"Export") into the Downloads folder.
-  async function save(url, name) {
-    try {
-      var r = await fetch(url);
-      var b = await r.blob();
-      var id = B.begin(name || 'download', b.type || '');
-      if (id < 0) { return; }
-      var step = 2 * 1024 * 1024;
-      for (var o = 0; o < b.size; o += step) {
-        var part = await new Promise(function (res, rej) {
-          var fr = new FileReader();
-          fr.onload = function () { res(String(fr.result).split(',')[1] || ''); };
-          fr.onerror = function () { rej(fr.error); };
-          fr.readAsDataURL(b.slice(o, o + step));
-        });
-        if (!B.write(id, part)) { B.end(id, false); return; }
-      }
-      B.end(id, true);
-    } catch (e) {
-      B.fail(String(e));
-    }
-  }
-  window.__acSave = save;
-
-  function special(a) {
-    var h = a.href || '';
-    return a.hasAttribute('download') && (h.indexOf('blob:') === 0 || h.indexOf('data:') === 0);
-  }
-
-  // Apps often create a detached <a download> and call .click() on it.
-  var origClick = HTMLElement.prototype.click;
-  HTMLAnchorElement.prototype.click = function () {
-    if (special(this)) { save(this.href, this.getAttribute('download')); return; }
-    return origClick.apply(this, arguments);
-  };
-  // Real clicks on <a download> elements that are in the page.
-  document.addEventListener('click', function (e) {
-    var a = e.target && e.target.closest ? e.target.closest('a[download]') : null;
-    if (a && special(a)) { e.preventDefault(); e.stopPropagation(); save(a.href, a.getAttribute('download')); }
-  }, true);
-})();
-"""
-
-MAIN_ACTIVITY_JAVA = r'''package @@PACKAGE@@;
-
-import android.app.Activity;
-import android.content.ActivityNotFoundException;
-import android.content.ContentValues;
-import android.content.Intent;
-import android.content.res.AssetManager;
-import android.graphics.Bitmap;
-import android.net.Uri;
-import android.os.Build;
-import android.os.Bundle;
-import android.os.Environment;
-import android.os.SystemClock;
-import android.provider.MediaStore;
-import android.util.Base64;
-import android.view.ViewGroup;
-import android.webkit.DownloadListener;
-import android.webkit.JavascriptInterface;
-import android.webkit.MimeTypeMap;
-import android.webkit.ServiceWorkerClient;
-import android.webkit.ServiceWorkerController;
-import android.webkit.URLUtil;
-import android.webkit.ValueCallback;
-import android.webkit.WebChromeClient;
-import android.webkit.WebResourceRequest;
-import android.webkit.WebResourceResponse;
-import android.webkit.WebSettings;
-import android.webkit.WebView;
-import android.webkit.WebViewClient;
-import android.widget.Toast;
-
-import org.json.JSONObject;
-
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.util.HashMap;
-import java.util.Locale;
-import java.util.Map;
-
-/**
- * Hosts the bundled web app (assets/www) in a WebView. Everything is served from the APK
- * through a virtual https origin, so the app works fully offline.
- */
-public class MainActivity extends Activity {
-    private static final String HOST = "appassets.androidplatform.net";
-    private static final String START_URL = "https://" + HOST + "/@@START_PATH@@";
-    private static final boolean BLOCK_NETWORK = @@BLOCK_NETWORK@@;
-    private static final boolean DEBUG_WEBVIEW = @@DEBUG_WEBVIEW@@;
-    private static final int REQ_FILE = 1001;
-
-    private WebView web;
-    private ValueCallback<Uri[]> fileCallback;
-    private String hookJs = "";
-    private long lastBack = 0;
-    private final DownloadBridge bridge = new DownloadBridge();
-
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
-        if (DEBUG_WEBVIEW) {
-            WebView.setWebContentsDebuggingEnabled(true);
-        }
-        hookJs = readAsset("artcraft_hook.js");
-
-        web = new WebView(this);
-        web.setLayoutParams(new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT));
-        setContentView(web);
-
-        WebSettings s = web.getSettings();
-        s.setJavaScriptEnabled(true);
-        s.setDomStorageEnabled(true);
-        s.setDatabaseEnabled(true);
-        s.setMediaPlaybackRequiresUserGesture(false);
-        s.setAllowFileAccess(false);
-        s.setSupportZoom(false);
-        s.setBuiltInZoomControls(false);
-
-        web.addJavascriptInterface(bridge, "AndroidBridge");
-
-        web.setWebViewClient(new WebViewClient() {
-            @Override
-            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
-                return serve(request);
-            }
-
-            @Override
-            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-                Uri u = request.getUrl();
-                String scheme = u.getScheme();
-                if (!"http".equals(scheme) && !"https".equals(scheme)) {
-                    return false;
-                }
-                if (HOST.equals(u.getHost())) {
-                    return false;
-                }
-                if (!BLOCK_NETWORK) {
-                    try {
-                        startActivity(new Intent(Intent.ACTION_VIEW, u));
-                    } catch (ActivityNotFoundException ignored) {
-                    }
-                }
-                return true;
-            }
-
-            @Override
-            public void onPageStarted(WebView view, String url, Bitmap favicon) {
-                super.onPageStarted(view, url, favicon);
-                inject(view);
-            }
-
-            @Override
-            public void onPageFinished(WebView view, String url) {
-                super.onPageFinished(view, url);
-                inject(view);
-            }
-        });
-
-        web.setWebChromeClient(new WebChromeClient() {
-            @Override
-            public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback,
-                                             FileChooserParams params) {
-                if (fileCallback != null) {
-                    fileCallback.onReceiveValue(null);
-                }
-                fileCallback = callback;
-                Intent i = new Intent(Intent.ACTION_GET_CONTENT);
-                i.addCategory(Intent.CATEGORY_OPENABLE);
-                i.setType("*/*");
-                if (params != null && params.getMode() == FileChooserParams.MODE_OPEN_MULTIPLE) {
-                    i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
-                }
-                try {
-                    startActivityForResult(Intent.createChooser(i, "Open file"), REQ_FILE);
-                } catch (ActivityNotFoundException e) {
-                    fileCallback = null;
-                    callback.onReceiveValue(null);
-                }
-                return true;
-            }
-        });
-
-        web.setDownloadListener(new DownloadListener() {
-            @Override
-            public void onDownloadStart(String url, String userAgent, String contentDisposition,
-                                        String mimeType, long contentLength) {
-                if (url.startsWith("blob:") || url.startsWith("data:")) {
-                    String name = URLUtil.guessFileName(url, contentDisposition, mimeType);
-                    web.evaluateJavascript("window.__acSave && window.__acSave("
-                            + JSONObject.quote(url) + "," + JSONObject.quote(name) + ")", null);
-                } else if (!BLOCK_NETWORK) {
-                    try {
-                        startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
-                    } catch (ActivityNotFoundException ignored) {
-                    }
-                }
-            }
-        });
-
-        try {
-            ServiceWorkerController.getInstance().setServiceWorkerClient(new ServiceWorkerClient() {
-                @Override
-                public WebResourceResponse shouldInterceptRequest(WebResourceRequest request) {
-                    return serve(request);
-                }
-            });
-        } catch (Throwable ignored) {
-        }
-
-        web.loadUrl(START_URL);
-    }
-
-    private void inject(WebView view) {
-        if (hookJs.length() > 0) {
-            view.evaluateJavascript(hookJs, null);
-        }
-    }
-
-    // ---- serving the bundled files -----------------------------------------------------
-
-    private WebResourceResponse serve(WebResourceRequest req) {
-        Uri u = req.getUrl();
-        Map<String, String> headers = new HashMap<String, String>();
-        headers.put("Cache-Control", "no-cache");
-        if (!HOST.equals(u.getHost())) {
-            if (BLOCK_NETWORK) {
-                return new WebResourceResponse("text/plain", "utf-8", 403, "Blocked", headers,
-                        new ByteArrayInputStream(new byte[0]));
-            }
-            return null; // let the WebView fetch it from the network
-        }
-        String path = u.getPath();
-        if (path == null || path.length() == 0 || "/".equals(path)) {
-            path = "/index.html";
-        } else if (path.endsWith("/")) {
-            path = path + "index.html";
-        }
-        String rel = path.substring(1);
-        if (rel.contains("..")) {
-            return notFound(headers);
-        }
-        try {
-            InputStream in = getAssets().open("www/" + rel, AssetManager.ACCESS_STREAMING);
-            String mime = mimeFor(rel);
-            boolean text = mime.startsWith("text/") || mime.equals("application/json")
-                    || mime.equals("image/svg+xml");
-            return new WebResourceResponse(mime, text ? "utf-8" : null, 200, "OK", headers, in);
-        } catch (IOException e) {
-            return notFound(headers);
-        }
-    }
-
-    private static WebResourceResponse notFound(Map<String, String> headers) {
-        return new WebResourceResponse("text/plain", "utf-8", 404, "Not Found", headers,
-                new ByteArrayInputStream("Not found".getBytes()));
-    }
-
-    private static String mimeFor(String path) {
-        String p = path.toLowerCase(Locale.ROOT);
-        int q = p.lastIndexOf('.');
-        String ext = q >= 0 ? p.substring(q + 1) : "";
-        switch (ext) {
-            case "html": case "htm": return "text/html";
-            case "js": case "mjs": return "text/javascript";
-            case "css": return "text/css";
-            case "json": case "map": return "application/json";
-            case "wasm": return "application/wasm";
-            case "txt": return "text/plain";
-            case "svg": return "image/svg+xml";
-            case "png": return "image/png";
-            case "jpg": case "jpeg": return "image/jpeg";
-            case "gif": return "image/gif";
-            case "webp": return "image/webp";
-            case "ico": return "image/x-icon";
-            case "woff2": return "font/woff2";
-            case "woff": return "font/woff";
-            case "ttf": return "font/ttf";
-            case "otf": return "font/otf";
-            case "webmanifest": return "application/manifest+json";
-            default: return "application/octet-stream";
-        }
-    }
-
-    private String readAsset(String name) {
-        try {
-            InputStream in = getAssets().open(name);
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            byte[] buf = new byte[8192];
-            int n;
-            while ((n = in.read(buf)) != -1) {
-                out.write(buf, 0, n);
-            }
-            in.close();
-            return out.toString("UTF-8");
-        } catch (IOException e) {
-            return "";
-        }
-    }
-
-    // ---- file picker -------------------------------------------------------------------
-
-    @Override
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        if (requestCode == REQ_FILE) {
-            if (fileCallback != null) {
-                Uri[] results = WebChromeClient.FileChooserParams.parseResult(resultCode, data);
-                fileCallback.onReceiveValue(results);
-                fileCallback = null;
-            }
-            return;
-        }
-        super.onActivityResult(requestCode, resultCode, data);
-    }
-
-    // ---- saving files to Downloads -----------------------------------------------------
-
-    private void toast(final String msg) {
-        runOnUiThread(new Runnable() {
-            @Override
-            public void run() {
-                Toast.makeText(MainActivity.this, msg, Toast.LENGTH_LONG).show();
-            }
-        });
-    }
-
-    private static String cleanName(String name, String mime) {
-        String n = name == null ? "" : name.replaceAll("[\\\\/:*?\"<>|]", "_").trim();
-        if (n.length() == 0) {
-            n = "download";
-        }
-        if (n.indexOf('.') < 0 && mime != null && mime.length() > 0) {
-            String ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(mime);
-            if (ext != null) {
-                n = n + "." + ext;
-            }
-        }
-        return n;
-    }
-
-    private static File uniqueFile(File dir, String name) {
-        File f = new File(dir, name);
-        String base = name;
-        String ext = "";
-        int dot = name.lastIndexOf('.');
-        if (dot > 0) {
-            base = name.substring(0, dot);
-            ext = name.substring(dot);
-        }
-        int i = 1;
-        while (f.exists()) {
-            f = new File(dir, base + " (" + i + ")" + ext);
-            i++;
-        }
-        return f;
-    }
-
-    public final class DownloadBridge {
-        private int nextId = 1;
-        private final Map<Integer, OutputStream> streams = new HashMap<Integer, OutputStream>();
-        private final Map<Integer, String> names = new HashMap<Integer, String>();
-
-        @JavascriptInterface
-        public synchronized int begin(String name, String mime) {
-            try {
-                String safe = cleanName(name, mime);
-                OutputStream os;
-                String shown = safe;
-                if (Build.VERSION.SDK_INT >= 29) {
-                    ContentValues v = new ContentValues();
-                    v.put(MediaStore.Downloads.DISPLAY_NAME, safe);
-                    v.put(MediaStore.Downloads.MIME_TYPE,
-                            (mime == null || mime.length() == 0) ? "application/octet-stream" : mime);
-                    v.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
-                    Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
-                    if (uri == null) {
-                        return -1;
-                    }
-                    os = getContentResolver().openOutputStream(uri);
-                    shown = "Downloads/" + safe;
-                } else {
-                    File dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
-                    if (dir == null) {
-                        return -1;
-                    }
-                    dir.mkdirs();
-                    File f = uniqueFile(dir, safe);
-                    os = new FileOutputStream(f);
-                    shown = f.getAbsolutePath();
-                }
-                if (os == null) {
-                    return -1;
-                }
-                int id = nextId++;
-                streams.put(id, os);
-                names.put(id, shown);
-                return id;
-            } catch (Exception e) {
-                toast("Save failed: " + e.getMessage());
-                return -1;
-            }
-        }
-
-        @JavascriptInterface
-        public synchronized boolean write(int id, String base64) {
-            OutputStream os = streams.get(id);
-            if (os == null) {
-                return false;
-            }
-            try {
-                os.write(Base64.decode(base64, Base64.DEFAULT));
-                return true;
-            } catch (Exception e) {
-                return false;
-            }
-        }
-
-        @JavascriptInterface
-        public synchronized void end(int id, boolean ok) {
-            OutputStream os = streams.remove(id);
-            String name = names.remove(id);
-            if (os == null) {
-                return;
-            }
-            try {
-                os.close();
-            } catch (IOException ignored) {
-            }
-            toast(ok ? "Saved: " + name : "Save failed: " + name);
-        }
-
-        @JavascriptInterface
-        public void fail(String message) {
-            toast("Save failed: " + message);
-        }
-    }
-
-    // ---- lifecycle ---------------------------------------------------------------------
-
-    @Override
-    public void onBackPressed() {
-        // The web apps have no autosave, so a stray back-swipe must not throw work away.
-        long now = SystemClock.elapsedRealtime();
-        if (now - lastBack < 2000) {
-            super.onBackPressed();
-        } else {
-            lastBack = now;
-            Toast.makeText(this, "Press back again to exit", Toast.LENGTH_SHORT).show();
-        }
-    }
-
-    @Override
-    protected void onPause() {
-        web.onPause();
-        super.onPause();
-    }
-
-    @Override
-    protected void onResume() {
-        super.onResume();
-        web.onResume();
-    }
-
-    @Override
-    protected void onDestroy() {
-        web.destroy();
-        super.onDestroy();
-    }
-}
-'''
-
-MANIFEST = """<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-
-    <!-- Required for WebView to work at all. The app itself is served from inside the APK. -->
-    <uses-permission android:name="android.permission.INTERNET" />
-
-    <application
-        android:allowBackup="false"
-        android:hardwareAccelerated="true"
-        android:icon="@drawable/ic_launcher"
-        android:label="@string/app_name"
-        android:largeHeap="true"
-        android:theme="@android:style/Theme.Material.NoActionBar"
-        android:usesCleartextTraffic="false">
-        <activity
-            android:name=".MainActivity"
-            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|density|uiMode|layoutDirection|fontScale"
-            android:exported="true"
-            android:windowSoftInputMode="adjustResize">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
-    </application>
-</manifest>
-"""
-
-DEFAULT_ICON_XML = """<?xml version="1.0" encoding="utf-8"?>
-<vector xmlns:android="http://schemas.android.com/apk/res/android"
-    android:width="108dp"
-    android:height="108dp"
-    android:viewportWidth="108"
-    android:viewportHeight="108">
-    <path android:fillColor="#FF2B2F36" android:pathData="M0,0h108v108h-108z" />
-    <path android:fillColor="#FFE8A33D"
-        android:pathData="M54,54m-26,0a26,26 0 1,0 52,0a26,26 0 1,0 -52,0" />
-</vector>
-"""
-
-
-def xml_escape(s: str) -> str:
-    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            .replace("'", "\\'").replace('"', '\\"'))
-
-
-def gradle_str(s: str) -> str:
-    return s.replace("\\", "/").replace("'", "\\'")
-
-
-def fetch_icon(owner: str, repo: str) -> Optional[bytes]:
-    for branch in ("main", "master"):
-        for size in (512, 256, 128, 64):
-            url = ("https://raw.githubusercontent.com/%s/%s/%s/assets/app-icon/hicolor/%dx%d/apps/ai.storyteller.%s.png"
-                   % (owner, repo, branch, size, size, repo))
-            try:
-                data = http_get(url, timeout=20)
-            except Exception:
-                continue
-            if data[:8] == b"\x89PNG\r\n\x1a\n":
-                return data
-    return None
-
-
-def find_web_root(extracted: Path) -> Path:
-    found = sorted(extracted.rglob("index.html"), key=lambda p: len(p.parts))
-    if not found:
-        die("The downloaded web build has no index.html - cannot wrap it.")
-    return found[0].parent
-
-
-def generate_project(project: Path, app: Dict[str, str], version: str, web_root: Path,
-                     keystore: Path, opts: argparse.Namespace) -> None:
-    slug = re.sub(r"[^a-z0-9]", "", app["repo"].lower()) or "app"
-    if slug[0].isdigit():
-        slug = "a" + slug
-    package = "com.artcraft." + slug
-    vname = re.sub(r"[^0-9A-Za-z._-]", "", version) or "1.0"
-    vcode = int(time.time() // 60)
-    start_path = "index.html" + ("?webgl" if opts.webgl else "")
-
-    rmtree(project)
-    main = project / "app" / "src" / "main"
-
-    write(project / "settings.gradle", """pluginManagement {
-    repositories {
-        google()
-        mavenCentral()
-        gradlePluginPortal()
-    }
-}
-dependencyResolutionManagement {
-    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-    repositories {
-        google()
-        mavenCentral()
-    }
-}
-rootProject.name = 'ArtCraftApp'
-include ':app'
-""")
-    write(project / "build.gradle",
-          "plugins {\n    id 'com.android.application' version '%s' apply false\n}\n" % AGP_VERSION)
-    write(project / "gradle.properties",
-          "org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8\nandroid.nonTransitiveRClass=true\n")
-    write(project / "app" / "build.gradle", """plugins {
-    id 'com.android.application'
-}
-
-android {
-    namespace '%(pkg)s'
-    compileSdk %(compile)d
-    buildToolsVersion '%(bt)s'
-
-    defaultConfig {
-        applicationId '%(pkg)s'
-        minSdk %(minsdk)d
-        targetSdk %(compile)d
-        versionCode %(vcode)d
-        versionName '%(vname)s'
-    }
-
-    signingConfigs {
-        release {
-            storeFile file('%(ks)s')
-            storePassword '%(pw)s'
-            keyAlias 'artcraft'
-            keyPassword '%(pw)s'
-        }
-    }
-
-    buildTypes {
-        release {
-            minifyEnabled false
-            signingConfig signingConfigs.release
-        }
-    }
-
-    compileOptions {
-        sourceCompatibility JavaVersion.VERSION_17
-        targetCompatibility JavaVersion.VERSION_17
-    }
-
-    // Keep every bundled web file (including folders that start with "_").
-    androidResources {
-        ignoreAssetsPattern = '!.svn:!.git'
-    }
-
-    lint {
-        checkReleaseBuilds = false
-        abortOnError = false
-    }
-}
-""" % {"pkg": package, "compile": COMPILE_SDK, "bt": BUILD_TOOLS, "minsdk": MIN_SDK, "vcode": vcode,
-       "vname": vname, "ks": gradle_str(str(keystore)), "pw": KEYSTORE_PASSWORD})
-
-    write(main / "AndroidManifest.xml", MANIFEST)
-    java = (MAIN_ACTIVITY_JAVA.replace("@@PACKAGE@@", package).replace("@@START_PATH@@", start_path)
-            .replace("@@BLOCK_NETWORK@@", "true" if opts.block_network else "false")
-            .replace("@@DEBUG_WEBVIEW@@", "true" if opts.debug_webview else "false"))
-    write(main / "java" / Path(*package.split(".")) / "MainActivity.java", java)
-    write(main / "res" / "values" / "strings.xml",
-          '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <string name="app_name">%s</string>\n</resources>\n'
-          % xml_escape(app["name"]))
-    write(main / "assets" / "artcraft_hook.js", HOOK_JS)
-
-    icon = fetch_icon(app["owner"], app["repo"])
-    if icon:
-        p = main / "res" / "drawable-xxxhdpi" / "ic_launcher.png"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(icon)
+def install_rust(rust: RustSetup, cache: Path) -> None:
+    cargo_home, rustup_home = private_rust_paths(cache)
+    env = os.environ.copy()
+    env.update(rust.env)
+    env.pop("RUSTUP_TOOLCHAIN", None)
+    if rust.action == "install":
+        url = "https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init"
+        sha = None
+        try:
+            sha = http_get(url + ".sha256").decode().split()[0]
+        except Exception:
+            say("      (checksum for rustup-init not available - continuing without verification)")
+        exe = cache / "downloads" / "rustup-init"
+        download(url, exe, "rustup-init", sha)
+        exe.chmod(0o755)
+        say("      Installing the Rust toolchain (stable) and the Android target ...")
+        r = subprocess.run([str(exe), "-y", "--profile", "minimal", "--default-toolchain", "stable",
+                            "--target", RUST_TARGET, "--no-modify-path"], env=env)
+        exe.unlink()
+        if r.returncode != 0:
+            die("Installing Rust failed (see the output above).")
+        rust.rustup = cargo_home / "bin" / "rustup"
     else:
-        say("      (no app icon found online - using a plain default icon)")
-        write(main / "res" / "drawable" / "ic_launcher.xml", DEFAULT_ICON_XML)
+        say("      Updating the Rust toolchain (stable) and adding the Android target ...")
+        r = subprocess.run([str(rust.rustup), "toolchain", "install", "stable", "--profile", "minimal",
+                            "--target", RUST_TARGET], env=env)
+        if r.returncode != 0:
+            die("Updating Rust failed (see the output above).")
+    rust.action = "ok"
+    rust.private = True
+    rust.bin_dirs = [cargo_home / "bin"]
+    rust.version, has = stable_status(rust.rustup, rust.env)  # type: ignore[arg-type]
+    if not rust.version or not has:
+        die("Rust was installed but the 'stable' toolchain with the %s target is not usable." % RUST_TARGET)
 
-    shutil.copytree(str(web_root), str(main / "assets" / "www"))
+
+def install_apk2(rust: RustSetup, cache: Path, java_home: Optional[Path]) -> None:
+    say("      Compiling cargo-apk2 (takes a few minutes) ...")
+    env = tool_env(rust, cache)
+    r = subprocess.run(["cargo", "install", "cargo-apk2", "--locked", "--root", str(cache / "cargo-tools")], env=env)
+    if r.returncode != 0:
+        die("Could not install cargo-apk2 (see the output above). If cargo reports a missing library,\n"
+            "       install pkg-config and libssl-dev (Debian/Ubuntu) and try again.")
 
 
-def build_apk(project: Path, java_home: Path, sdk: Path, gradle: Path) -> Path:
-    write(project / "local.properties", "sdk.dir=%s\n" % sdk.as_posix())
-    env = make_env(java_home, sdk)
-    say("      Running Gradle (first run downloads the Android Gradle Plugin - please wait) ...\n")
-    rc = subprocess.call([str(gradle), "--no-daemon", "--console=plain", "-p", str(project), "assembleRelease"],
-                         env=env, cwd=str(project))
-    apk = project / "app" / "build" / "outputs" / "apk" / "release" / "app-release.apk"
-    if rc != 0 or not apk.exists():
-        hint = ["The Gradle build failed (exit code %d). Common causes:" % rc,
-                "  - no internet access to dl.google.com / maven.google.com / repo.maven.apache.org",
-                "    (behind a proxy? set JAVA_TOOL_OPTIONS or ~/.gradle/gradle.properties proxy settings)",
-                "  - the Android build tools do not run on this CPU (e.g. ARM Linux)",
-                "  - not enough disk space or memory (Gradle wants ~2 GB RAM)",
-                "The generated project was kept for inspection: %s" % project]
-        die("\n".join(hint))
-    return apk
+# --------------------------------------------------------------------------------------
+# App source
+# --------------------------------------------------------------------------------------
+def git(args: List[str], cwd: Optional[Path] = None, quiet: bool = False) -> subprocess.CompletedProcess:
+    return subprocess.run(["git"] + args, cwd=str(cwd) if cwd else None, text=True,
+                          capture_output=quiet)
+
+
+def prepare_source(root: Path, app: Dict[str, str], ref: Optional[str], fresh: bool) -> Path:
+    owner, repo = app["owner"], app["repo"]
+    url = "https://github.com/%s/%s.git" % (owner, repo)
+    src = root / "source" / repo
+    (root / "source").mkdir(parents=True, exist_ok=True)
+    if src.exists():
+        if not (src / ".git").is_dir():
+            die("%s exists but is not a git checkout. Move it away and run again." % src)
+        origin = git(["remote", "get-url", "origin"], src, quiet=True).stdout.strip()
+        if origin.removesuffix(".git").rstrip("/") != url.removesuffix(".git"):
+            die("%s has an unexpected origin '%s'; refusing to touch it." % (src, origin))
+        same = False
+        if ref and not fresh:
+            same = git(["describe", "--tags", "--exact-match"], src, quiet=True).stdout.strip() == ref
+        if same:
+            say("      Reusing the existing checkout of %s (already at %s)." % (repo, ref))
+        else:
+            rmtree(src)
+    if not src.exists():
+        say("      Downloading the source of %s (%s) ..." % (app["name"], ref or "main branch"))
+        if ref and re.fullmatch(r"[0-9a-f]{7,40}", ref):
+            src.mkdir(parents=True)
+            for cmd in (["init", "-q"], ["remote", "add", "origin", url],
+                        ["fetch", "--depth", "1", "origin", ref], ["-c", "advice.detachedHead=false", "checkout", "-q", "FETCH_HEAD"]):
+                if git(cmd, src).returncode != 0:
+                    die("git %s failed." % cmd[0])
+        else:
+            cmd = ["-c", "advice.detachedHead=false", "clone", "--depth", "1"]
+            if ref:
+                cmd += ["--branch", ref]
+            if git(cmd + [url, str(src)]).returncode != 0:
+                die("Could not download %s%s." % (url, (" at '%s'" % ref) if ref else ""))
+    rev = git(["rev-parse", "--short", "HEAD"], src, quiet=True).stdout.strip()
+    say("      Source ready: %s @ %s" % (repo, rev or "?"))
+    return src
+
+
+def link_persistent(root: Path, cache: Path) -> None:
+    """Keep the builder's working folders in the cache so they survive builder updates."""
+    base = cache / "native"
+    for name in ("source", "build", "keys", "logs", "output"):
+        target = base / name
+        target.mkdir(parents=True, exist_ok=True)
+        link = root / name
+        if link.is_symlink():
+            if link.resolve() != target.resolve():
+                link.unlink()
+                link.symlink_to(target)
+        elif link.exists():
+            if link.is_dir() and not any(link.iterdir()):
+                link.rmdir()
+                link.symlink_to(target)
+        else:
+            link.symlink_to(target)
+
+
+# --------------------------------------------------------------------------------------
+# Build
+# --------------------------------------------------------------------------------------
+def build_env(cache: Path, java_home: Path, sdk: Path, ndk: Path, rust: RustSetup) -> Dict[str, str]:
+    env = tool_env(rust, cache, [python_shim(cache), java_home / "bin"])
+    env["JAVA_HOME"] = str(java_home)
+    env["ANDROID_HOME"] = env["ANDROID_SDK_ROOT"] = str(sdk)
+    env["ANDROID_NDK_HOME"] = env["ANDROID_NDK_ROOT"] = env["NDK_HOME"] = str(ndk)
+    env["ARTCRAFT_TARGET_SDK"] = str(TARGET_SDK)
+    env["ARTCRAFT_BUILD_TOOLS_VERSION"] = BUILD_TOOLS
+    return env
+
+
+def run_builder(root: Path, app: Dict[str, str], args: argparse.Namespace, env: Dict[str, str]) -> Path:
+    cmd = ["bash", str(root / "lib" / "build-common.sh"), "debug" if args.debug else "release", "-" + app["repo"]]
+    if args.appname:
+        cmd.append("-appname=%s" % args.appname)
+    if args.packagename:
+        cmd.append("-packagename=%s" % args.packagename)
+    if args.appicon:
+        cmd.append("-appicon=%s" % Path(args.appicon).expanduser().resolve())
+    started = time.time()
+    say("      (first build of an app compiles hundreds of Rust crates: expect 15-40 minutes)\n")
+    rc = subprocess.call(cmd, env=env, cwd=str(root))
+    out = root / "output"
+    apks = sorted(out.glob("%s-*.apk" % app["repo"]), key=lambda p: p.stat().st_mtime, reverse=True)
+    apks = [p for p in apks if p.name.endswith("-debug.apk") == bool(args.debug) and p.stat().st_mtime >= started - 5]
+    if rc != 0 or not apks:
+        logs = sorted((root / "logs").glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+        lines = ["The build failed (exit code %d)." % rc,
+                 "  - Read the build log: %s" % (logs[0] if logs else root / "logs"),
+                 "  - A release tag can be older than the builder expects: try   --main",
+                 "  - The builder may have been fixed since the pinned version: try   --builder-ref main",
+                 "  - Not enough disk space (needs ~15 GB) or memory (linking needs ~8 GB) are common causes"]
+        die("\n".join(lines))
+    return apks[0]
 
 
 # --------------------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Build an offline Android APK from an ArtCraft web app.",
-                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=("Examples" + __doc__.split("Examples", 1)[1])
-                                 if "Examples" in (__doc__ or "") else "")
+    ap = argparse.ArgumentParser(description="Build native Android APKs of the ArtCraft apps from source.",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog="Examples" + (__doc__ or "").split("Examples", 1)[1])
     ap.add_argument("--list", action="store_true", help="list the available apps and exit")
     ap.add_argument("--app", help="app name or number from --list (skips the menu)")
-    ap.add_argument("--repo", help="build any GitHub repo that publishes a web build, as owner/name")
     ap.add_argument("--yes", "-y", action="store_true", help="don't ask for confirmation before downloading tools")
-    ap.add_argument("--cache", help="folder for downloaded tools "
+    ap.add_argument("--cache", help="folder for downloaded tools and build files "
                                     "(default: $ARTCRAFT_APK_HOME or ~/.artcraft-apk)")
     ap.add_argument("--output", default="output", help="folder for the finished APK (default: ./output)")
-    ap.add_argument("--webgl", action="store_true", help="start with ?webgl (force the WebGL2 fallback; PhotoCraft)")
-    ap.add_argument("--block-network", action="store_true",
-                    help="make the app strictly offline: block every request that is not bundled")
-    ap.add_argument("--debug-webview", action="store_true",
-                    help="allow inspecting the app from chrome://inspect on a computer")
-    ap.add_argument("--generate-only", action="store_true",
-                    help="only write the Android Studio project; do not install tools or build")
-    ap.add_argument("--keep-project", action="store_true", help="keep the generated Android project after building")
+    ap.add_argument("--main", action="store_true",
+                    help="build the newest development code (main branch) instead of the latest release")
+    ap.add_argument("--ref", help="build a specific tag, branch or commit of the app instead")
+    ap.add_argument("--debug", action="store_true", help="build a debug APK (larger and slower than release)")
+    ap.add_argument("--appname", help="override the app's display name")
+    ap.add_argument("--packagename", help="override the Android package name (default: com.artcraft.<app>)")
+    ap.add_argument("--appicon", help="path to a PNG to use as the launcher icon")
+    ap.add_argument("--builder-ref", default=BUILDER_PIN,
+                    help="commit/branch/tag of the artcraft-android builder to use (default: reviewed pin)")
+    ap.add_argument("--builder-path", help="use a local checkout of the artcraft-android builder")
+    ap.add_argument("--setup-only", action="store_true",
+                    help="install the tools and fetch the source, but do not build")
+    ap.add_argument("--fresh", action="store_true", help="always re-download the app source")
     return ap.parse_args()
 
 
 def main() -> None:
+    ensure_python311()
     try:
         sys.stdout.reconfigure(errors="replace")  # type: ignore[attr-defined]
     except Exception:
         pass
     args = parse_args()
-    cache = Path(args.cache or os.environ.get("ARTCRAFT_APK_HOME") or (Path.home() / ".artcraft-apk")).expanduser()
-    total = 5 if args.generate_only else 7
+    cache = Path(args.cache or os.environ.get("ARTCRAFT_APK_HOME") or (Path.home() / ".artcraft-apk")).expanduser().resolve()
+    total = 5 if args.setup_only else 7
 
-    # ---- 1. apps -------------------------------------------------------------------------
+    # ---- 1. builder + app list -------------------------------------------------------------
     step(1, total, "Fetching the list of ArtCraft apps ...")
-    apps = discover_apps()
+    cache.mkdir(parents=True, exist_ok=True)
+    builder_root, local_builder = fetch_builder(cache, args.builder_ref, args.builder_path)
+    apps = discover_apps(builder_root)
+    say("      Builder: %s  (MIT licensed, by MostafaXS1)" %
+        (builder_root if local_builder else "github.com/%s @ %s" % (BUILDER_REPO, args.builder_ref[:10])))
     if args.list:
         for i, a in enumerate(apps, 1):
-            say("  %d) %-12s %-14s %s" % (i, a["name"], "(%s/%s)" % (a["owner"], a["repo"]), a["desc"]))
+            say("  %2d) %-12s %s" % (i, a["name"], a["desc"]))
         return
 
-    # ---- 2. choose -----------------------------------------------------------------------
+    # ---- 2. choose ---------------------------------------------------------------------------
     step(2, total, "Choosing the app ...")
-    app = choose_app(apps, args.app, args.repo)
+    app = choose_app(apps, args.app)
     say("      Selected: %s  (github.com/%s/%s)" % (app["name"], app["owner"], app["repo"]))
+    check_platform()
+    preflight()
 
-    # ---- 3. latest web build ---------------------------------------------------------------
-    step(3, total, "Looking for the latest web build ...")
-    rel = find_web_release(app)
-    size = (" (%s)" % human(rel["size"])) if rel.get("size") else ""
-    say("      Latest web build: %s  ->  %s%s%s" % (rel["tag"], rel["name"], size,
-                                                  "  [pre-release]" if rel["prerelease"] else ""))
-    if not rel["sha256"]:
-        say("      Warning: no checksum was published for this file, so it cannot be verified.")
-
-    java_home: Optional[Path] = None
-    sdk_plan: Optional[SdkPlan] = None
-    gradle: Optional[Path] = None
-
-    # ---- 4. tools --------------------------------------------------------------------------
-    if not args.generate_only:
-        step(4, total, "Checking the build tools on this computer ...")
-        if ARCH == "aarch64" and OS == "linux":
-            say("      Warning: Google's Android build tools are built for x86-64. On ARM Linux the build may fail.")
-        java_home, jmajor = find_java(cache)
-        sdk_plan = plan_sdk(cache)
-        env0 = make_env(java_home, None) if java_home else os.environ.copy()
-        gradle = find_gradle(cache, env0)
-
-        say("      Java (JDK %d-%d) : %s" % (JDK_ACCEPT[0], JDK_ACCEPT[-1],
-            ("found  %s  (version %d)" % (java_home, jmajor)) if java_home else "NOT FOUND"))
-        if not sdk_plan.missing:
-            say("      Android SDK       : found  %s  (platform %d + build-tools %s)" % (sdk_plan.path, COMPILE_SDK, BUILD_TOOLS))
-        elif sdk_plan.existing and not sdk_plan.private:
-            say("      Android SDK       : found  %s  but missing: %s" % (sdk_plan.path, ", ".join(sdk_plan.missing)))
+    # ---- 3. latest version -------------------------------------------------------------------
+    step(3, total, "Looking for the latest version ...")
+    if args.ref:
+        ref, label = args.ref, "%s (your choice)" % args.ref
+    elif args.main:
+        ref, label = None, "main branch (newest development code)"
+    else:
+        ref = latest_version(app["owner"], app["repo"])
+        if ref:
+            label = "%s (latest release)" % ref
         else:
-            say("      Android SDK       : NOT FOUND")
-        say("      Gradle %s+      : %s" % (GRADLE_VERSION, ("found  %s" % gradle) if gradle else "NOT FOUND"))
+            say("      No release tags found - using the main branch.")
+            label = "main branch"
+    min_rust = max(min_rust_version(app["owner"], app["repo"], ref), APK2_MIN_RUST, key=vtuple)
+    say("      Version : %s" % label)
+    say("      Needs   : Rust %s or newer" % min_rust)
+    if not args.ref and not args.main and ref:
+        say("      (The main branch is usually newer than the latest release. Use --main to build that.)")
 
-        items: List[Tuple[str, int, str]] = []  # (what, MB, where)
-        if not java_home:
-            items.append(("JDK 17 (Eclipse Temurin)", 190, str(cache / "jdk")))
-        if not gradle:
-            items.append(("Gradle %s" % GRADLE_VERSION, 130, str(cache / "gradle")))
-        if sdk_plan.need_cmdline:
-            items.append(("Android SDK command-line tools", 150, str(sdk_plan.path / "cmdline-tools")))
-        if sdk_plan.missing:
-            where = str(sdk_plan.path)
-            label = "Android SDK: " + ", ".join(sdk_plan.missing)
-            if sdk_plan.existing and not sdk_plan.private:
-                label += "  (added to your existing SDK; nothing already there is changed)"
-            mb = sum(65 if pkg.startswith("platforms") else 60 for pkg in sdk_plan.missing)
-            items.append((label, mb, where))
-        if not agp_cached():
-            items.append(("Android Gradle Plugin + libraries (fetched by Gradle while building)", 150,
-                          str(gradle_user_home())))
+    # ---- 4. tools ----------------------------------------------------------------------------
+    step(4, total, "Checking the build tools on this computer ...")
+    java_home, jmajor = find_java(cache)
+    sdk_plan = plan_sdk(cache)
+    rust = plan_rust(cache, min_rust)
+    apk2 = apk2_present(rust, cache)
 
-        if items:
-            bar = "=" * 74
-            say("\n" + bar)
-            say(" THE FOLLOWING WILL BE DOWNLOADED AND SAVED ON THIS COMPUTER")
-            say(bar)
-            for what, mb, where in items:
-                say("  * %s\n      about %d MB  ->  %s" % (what, mb, where))
-            say("\n  Total: roughly %d MB. Tools that were found above are used as they are." % sum(i[1] for i in items))
-            if sdk_plan.missing:
-                say("  Android SDK licenses (https://developer.android.com/studio/terms) are accepted automatically.")
-            say("  To remove everything this script saved, delete: %s" % cache)
-            say(bar)
-            if not confirm("Download and continue?", args.yes):
-                say("\nCancelled. Nothing was downloaded.")
-                sys.exit(0)
-            try:
-                free = shutil.disk_usage(str(cache if cache.exists() else Path.home())).free
-                if free < 3 * 1024 ** 3:
-                    say("      Warning: only %s of free disk space." % human(free))
-            except Exception:
-                pass
-            cache.mkdir(parents=True, exist_ok=True)
-        else:
-            say("      Everything needed is already installed - no tool downloads.")
+    say("      Java (JDK %d-%d)      : %s" % (JDK_ACCEPT[0], JDK_ACCEPT[-1],
+        ("found  %s  (version %d)" % (java_home, jmajor)) if java_home else "NOT FOUND"))
+    if not sdk_plan.missing:
+        say("      Android SDK          : found  %s" % sdk_plan.path)
+        say("      Android NDK          : found  %s" % find_ndk(sdk_plan.path))
+    elif sdk_plan.existing and not sdk_plan.private:
+        say("      Android SDK          : found  %s  but missing: %s" % (sdk_plan.path, ", ".join(sdk_plan.missing)))
+    else:
+        say("      Android SDK + NDK    : NOT FOUND (needs platform %d, build-tools %s, NDK %s)" %
+            (TARGET_SDK, BUILD_TOOLS, NDK_PINNED))
+    if rust.action == "ok":
+        say("      Rust (stable)        : found  %s  (%s, has %s)" % ("your own install" if not rust.private else "in cache", rust.version, RUST_TARGET))
+    else:
+        say("      Rust %s+ (stable)     : %s" % (min_rust, "NOT FOUND" if rust.action == "install"
+                                                   else "needs an update / the %s target" % RUST_TARGET))
+    say("      cargo-apk2           : %s" % ("found" if apk2 else "NOT FOUND"))
 
+    items: List[Tuple[str, int, str]] = []
+    if not java_home:
+        items.append(("JDK 17 (Eclipse Temurin)", 190, str(cache / "jdk")))
+    if sdk_plan.need_cmdline:
+        items.append(("Android SDK command-line tools", 150, str(sdk_plan.path / "cmdline-tools")))
+    for pkg in sdk_plan.missing:
+        mb = 65 if pkg.startswith("platforms") else 60 if pkg.startswith("build-tools") else 1000
+        extra = "  (added to your existing SDK; nothing already there is changed)" if (sdk_plan.existing and not sdk_plan.private) else ""
+        items.append(("Android SDK package: %s%s" % (pkg, extra), mb, str(sdk_plan.path)))
+    if rust.action != "ok":
+        items.append(("Rust toolchain (rustup + stable + %s)" % RUST_TARGET, 300, str(cache / "rust")))
+    if not apk2:
+        items.append(("cargo-apk2 (compiled from source, a few minutes)", 60, str(cache / "cargo-tools")))
+    items.append(("Rust libraries for the app (downloaded by cargo during the build)", 700,
+                  str((cache / "rust" / "cargo") if rust.private else Path(os.environ.get("CARGO_HOME") or Path.home() / ".cargo"))))
+    items.append(("Build output of the app (the first build is large)", 5000, str(cache / "native" / "build")))
+
+    install_needed = (not java_home) or sdk_plan.need_cmdline or bool(sdk_plan.missing) or rust.action != "ok" or not apk2
+    bar = "=" * 74
+    say("\n" + bar)
+    say(" THE FOLLOWING WILL BE DOWNLOADED AND SAVED ON THIS COMPUTER")
+    say(bar)
+    for what, mb, where in items:
+        size = ("about %.1f GB" % (mb / 1000.0)) if mb >= 1000 else ("about %d MB" % mb)
+        say("  * %s\n      %s  ->  %s" % (what, size, where))
+    say("\n  Total: roughly %.1f GB of disk space and 15-40 minutes for the first build."
+        % (sum(i[1] for i in items) / 1000.0))
+    say("  Tools that were found above are used as they are; your own Rust setup is never modified.")
+    if sdk_plan.missing:
+        say("  Android SDK licenses (https://developer.android.com/studio/terms) are accepted automatically.")
+    say("  To remove everything this script saved, delete: %s" % cache)
+    say(bar)
+    if not confirm("Continue?", args.yes):
+        say("\nCancelled. No build tools were downloaded.")
+        sys.exit(0)
+    try:
+        free = shutil.disk_usage(str(cache)).free
+        if free < 15 * 1024 ** 3:
+            say("      Warning: only %s of free disk space (15 GB or more is recommended)." % human(free))
+    except Exception:
+        pass
+
+    if install_needed:
         if not java_home:
             say("\n      Downloading the JDK ...")
             java_home = install_jdk(cache)
-        if not gradle:
-            say("\n      Downloading Gradle ...")
-            gradle = install_gradle(cache)
         if sdk_plan.need_cmdline or sdk_plan.missing:
-            say("\n      Setting up the Android SDK ...")
+            say("\n      Setting up the Android SDK and NDK ...")
             install_sdk(sdk_plan, cache, java_home)
+        if rust.action != "ok":
+            say("\n      Setting up Rust ...")
+            install_rust(rust, cache)
+        if not apk2:
+            say("\n      Setting up cargo-apk2 ...")
+            install_apk2(rust, cache, java_home)
+    ndk = find_ndk(sdk_plan.path)
+    if not ndk or not java_home:
+        die("Internal error: the Android NDK or JDK is still not available.")
+    if rust.version and vtuple(rust.version) < vtuple(min_rust):
+        die("Rust %s is installed but %s needs %s or newer." % (rust.version, app["name"], min_rust))
 
-    # ---- 5. download the web build -----------------------------------------------------------
-    step(4 if args.generate_only else 5, total, "Downloading the %s web build ..." % app["name"])
-    cache.mkdir(parents=True, exist_ok=True)
-    archive = cache / "downloads" / rel["name"]
-    download(rel["url"], archive, rel["name"], rel["sha256"])
-    if rel["sha256"]:
-        say("      Checksum OK (SHA-256).")
-    work = cache / "build" / app["repo"]
-    extracted = work / "web"
-    rmtree(work)
-    extract(archive, extracted)
-    archive.unlink()
-    web_root = find_web_root(extracted)
-
-    # ---- 6. generate project ---------------------------------------------------------------
-    step(5 if args.generate_only else 6, total, "Generating the Android project ...")
-    if args.generate_only:
-        project = Path(args.output).resolve() / ("%s-android-project" % app["repo"])
-        keystore = cache / "signing" / "artcraft-release.keystore"
-    else:
-        project = work / "android"
-        keystore = ensure_keystore(cache, java_home)  # type: ignore[arg-type]
-    generate_project(project, app, rel["version"], web_root, keystore, args)
-    say("      Project: %s" % project)
-    if args.generate_only:
-        say("\nDone. Open this folder in Android Studio, or build it with: gradle assembleRelease")
-        rmtree(work)
+    # ---- 5. source ---------------------------------------------------------------------------
+    step(5, total, "Downloading the %s source code ..." % app["name"])
+    if not local_builder:
+        link_persistent(builder_root, cache)
+    prepare_source(builder_root, app, ref, args.fresh)
+    if args.setup_only:
+        say("\nSetup finished. Run again without --setup-only to build.")
         return
 
-    # ---- 7. build ----------------------------------------------------------------------------
-    step(7, total, "Building and signing the APK ...")
-    apk = build_apk(project, java_home, sdk_plan.path, gradle)  # type: ignore[arg-type]
+    # ---- 6. build ----------------------------------------------------------------------------
+    step(6, total, "Compiling %s for Android (arm64) ..." % app["name"])
+    env = build_env(cache, java_home, sdk_plan.path, ndk, rust)
+    apk = run_builder(builder_root, app, args, env)
+
+    # ---- 7. finish ---------------------------------------------------------------------------
+    step(7, total, "Collecting the APK ...")
     out_dir = Path(args.output).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    final = out_dir / ("%s-%s.apk" % (re.sub(r"[^A-Za-z0-9._-]", "", app["name"]) or app["repo"], rel["version"]))
+    final = out_dir / apk.name
     shutil.copyfile(str(apk), str(final))
-    if not args.keep_project:
-        rmtree(work)
-
+    sha = hashlib.sha256(final.read_bytes()).hexdigest()
     say("\n" + "=" * 74)
     say(" DONE:  %s  (%s)" % (final, human(final.stat().st_size)))
+    say(" SHA-256: %s" % sha)
     say("=" * 74)
-    say(" Install it on your phone:")
-    say("   - copy the .apk to the phone, open it, and allow \"install unknown apps\" when asked; or")
+    say(" Install it on a 64-bit ARM Android phone or tablet:")
+    say("   - copy the .apk to the device, open it, and allow \"install unknown apps\" when asked; or")
     say("   - with a USB cable and USB debugging on:  adb install -r \"%s\"" % final)
-    say(" If the screen stays blank, rebuild with --webgl (and --debug-webview to inspect it).")
+    say(" This is a locally signed build for personal use. Keep this key to install updates over it:")
+    say("   %s" % (builder_root / "keys" / "artcraft-builder.jks").resolve())
 
 
 if __name__ == "__main__":
