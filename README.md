@@ -1,64 +1,53 @@
 # ArtCraft APK Builder
 
-A single-file Python script that turns an [ArtCraft](https://getartcraft.com/) web app (PhotoCraft, VectorCraft, FilmCraft and the other Crafting Apps) into an **offline Android APK**.
+A single-file Python script that builds **native Android apps** from the [ArtCraft](https://getartcraft.com/) apps (PhotoCraft, VectorCraft, FilmCraft and the other Crafting Apps).
 
-It fetches the app list, lets you pick one, downloads the app's latest official web build, verifies its checksum, bundles it into a small Android WebView shell, and builds and signs the APK. The web files live inside the APK, so the installed app runs without an internet connection.
+It fetches the list of apps, lets you pick one, finds its latest version, checks which build tools you already have, downloads only what is missing (after telling you exactly what and where), and compiles the app's Rust source into a signed arm64 APK. There is no WebView: the result is the real native app, and it works fully offline.
 
-> **Unofficial.** This project is not affiliated with or endorsed by ArtCraft. It only wraps the web builds that each app publishes on its GitHub releases page.
+> **Unofficial.** This project is not affiliated with or endorsed by ArtCraft or by the author of the builder it uses (see [Credits](#credits)).
 
 ---
 
 ## Features
 
-- **Zero dependencies.** Python 3.8+ standard library only. Nothing to `pip install`.
-- **Always the latest build.** Finds the newest GitHub release that contains a `*-web-*.zip` and verifies it against the published `SHA256SUMS.txt`.
-- **Detects existing tools first.** Uses the JDK, Android SDK and Gradle already on your machine, and downloads only what is missing.
-- **Tells you before downloading.** Lists exactly what will be downloaded, how big it is and where it will be saved, then asks for confirmation.
-- **Fully offline app.** Web files are served from inside the APK. An optional strict mode blocks all other network requests.
-- **Works for phones and tablets.** Handles file opening and saving (exports go to your Downloads folder).
-- **No API limit problems.** If GitHub's API rate limit is hit, it falls back to reading the public release pages.
-- **Cross-platform.** Windows, macOS and Linux.
+- **Same simple flow every time:** list apps, choose one, get the latest version, set up tools, build.
+- **Latest release by default.** Builds the newest released version of the app, or the newest development code with `--main`.
+- **Detects existing tools first.** Uses the JDK, Android SDK/NDK and Rust already on your machine, and downloads only what is missing.
+- **Tells you before downloading.** Lists every download with its size and where it will be saved, then asks for confirmation.
+- **Self-contained.** Everything it downloads goes into one cache folder. Your own Rust setup is never modified.
+- **Supports all 13 apps** the builder knows: PhotoCraft, VectorCraft, FilmCraft, LightCraft, PdfCraft, EffectCraft, DesignCraft, FigCraft, WordCraft, SoundCraft, DeckCraft, CADCraft and GridCraft. The list is read live, so new apps appear automatically.
+- **Pure Python standard library.** Nothing to `pip install`.
 
-## Supported apps
+## Requirements
 
-At the time of writing, all seven Crafting Apps publish a web build:
-
-| App | What it is for |
+| Needed | Notes |
 |---|---|
-| PhotoCraft | Image editing: layers, masks, type and real PSD files |
-| VectorCraft | Vector illustration |
-| FilmCraft | Video editing, color and sound |
-| LightCraft | Photo library and raw development |
-| PdfCraft | Reading, organizing and protecting PDFs |
-| EffectCraft | Motion graphics and visual effects |
-| DesignCraft | Page layout and publishing |
+| **Linux x86-64** | On Windows, use [WSL2](https://learn.microsoft.com/windows/wsl/install) (Ubuntu). macOS and ARM Linux are not supported (the Android NDK and the builder are Linux x86-64 only). |
+| **Python 3.11+** | Needed to read Cargo manifests. |
+| **git** and a **C compiler** | Debian/Ubuntu: `sudo apt install git build-essential` |
+| **~15 GB free disk space** | The Android NDK, the Rust toolchain and the first build are large. |
+| **~8 GB RAM** | Linking the Rust apps is memory-hungry. |
+| **Internet** | For the first run. |
 
-The list is read live from the PhotoCraft README, so new apps appear automatically. Any other GitHub repo that publishes a `*-web-*.zip` release can be built with `--repo owner/name`.
+Everything else (JDK, Android SDK and NDK, Rust, `cargo-apk2`) is detected, or downloaded by the script if missing. You can't install the system packages above automatically because they need root, so the script checks them first and tells you what to install.
+
+The APK is for **64-bit ARM (arm64-v8a)** Android devices, which is nearly every phone and tablet from the last several years.
 
 ## Quick start
 
 ```bash
 git clone https://github.com/maheshmv666/ArtCraft-APK-Builder.git
-cd ArtCraft-APK-Builder
+cd <this-repo>
 python3 artcraft_apk.py
 ```
 
-Pick an app from the menu. When it finishes, your APK is in `./output/`.
+Pick an app from the menu. The first build compiles hundreds of Rust crates and takes **15-40 minutes**; later builds are much faster. When it finishes, the APK is in `./output/`.
 
 Skip the menu:
 
 ```bash
 python3 artcraft_apk.py --app photocraft
 ```
-
-## Requirements
-
-- **Python 3.8 or newer**
-- **An internet connection** for the first run (to fetch the web build and any missing tools)
-- About **3 GB of free disk space** if the build tools must be downloaded
-- About **2 GB of RAM** for the Gradle build
-
-The build tools themselves (JDK 17-21, Android SDK, Gradle 8.7+) are detected, and installed by the script if missing.
 
 ## What gets downloaded, and where
 
@@ -68,23 +57,24 @@ The script checks your system first. If something is missing you will see a warn
 ==========================================================================
  THE FOLLOWING WILL BE DOWNLOADED AND SAVED ON THIS COMPUTER
 ==========================================================================
-  * Gradle 8.7
-      about 130 MB  ->  /home/you/.artcraft-apk/gradle
-  * Android SDK: platforms;android-34, build-tools;34.0.0
-      about 130 MB  ->  /home/you/.artcraft-apk/android-sdk
+  * Android SDK package: ndk;27.2.12479018
+      about 1.0 GB  ->  /home/you/.artcraft-apk/android-sdk
+  * Rust toolchain (rustup + stable + aarch64-linux-android)
+      about 300 MB  ->  /home/you/.artcraft-apk/rust
   ...
-Download and continue? [Y/n]
+Continue? [Y/n]
 ```
 
 | Tool | Detected from | Downloaded if missing |
 |---|---|---|
-| JDK 17-21 (with `javac`, `keytool`, `jlink`) | `JAVA_HOME`, `java` on `PATH`, Android Studio's bundled JDK, the cache | Eclipse Temurin 17 from Adoptium |
-| Android SDK (platform 34 + build-tools 34.0.0) | `ANDROID_HOME`, `ANDROID_SDK_ROOT`, default install locations, the cache | Google's command-line tools, then the packages |
-| Gradle 8.7+ | the cache, `gradle` on `PATH` | Gradle 8.7 from services.gradle.org |
-| Android Gradle Plugin and libraries | `~/.gradle` cache | Fetched by Gradle during the build |
+| JDK 17-21 (`java`, `javac`, `keytool`) | `JAVA_HOME`, `java` on `PATH`, Android Studio's JDK, the cache | Eclipse Temurin 17 |
+| Android SDK (platform 35, build-tools 35.0.0) and NDK 25+ | `ANDROID_HOME`, `ANDROID_SDK_ROOT`, `ANDROID_NDK_HOME`, `~/Android/Sdk`, the cache | Google's command-line tools, then the packages (NDK 27) |
+| Rust (stable, with the `aarch64-linux-android` target, new enough for the app) | your `rustup`, the cache | `rustup` into the cache |
+| `cargo-apk2` | `cargo apk2` on `PATH`, the cache | compiled from source into the cache |
 
-- Everything the script downloads goes into one **cache folder**, by default `~/.artcraft-apk`. Delete it to remove everything. (The Gradle plugin cache is the exception: Gradle keeps it in `~/.gradle`.)
-- If an existing SDK is only missing some packages, those are added to it and nothing already there is changed. If the existing SDK is read-only, a private copy is used instead.
+- Everything downloaded goes into the **cache folder**, by default `~/.artcraft-apk`. Delete it to remove everything. (Cargo's library cache is the one exception if you use your own Rust: it lives in your usual `~/.cargo`.)
+- If your own Rust install already satisfies the requirements, it is used as it is. Otherwise a **separate private copy** is installed in the cache, and your own setup is never touched.
+- If an existing Android SDK is only missing some packages, those are added and nothing already there is changed.
 - Android SDK licenses are accepted automatically. By continuing you agree to the [Android SDK terms](https://developer.android.com/studio/terms).
 
 ## Options
@@ -93,83 +83,83 @@ Download and continue? [Y/n]
 |---|---|
 | `--list` | List the available apps and exit |
 | `--app NAME` | App name or number from `--list`; skips the menu |
-| `--repo OWNER/NAME` | Build any GitHub repo that publishes a web build |
-| `--yes`, `-y` | Don't ask for confirmation before downloading tools |
-| `--cache DIR` | Where downloaded tools are saved (default: `$ARTCRAFT_APK_HOME` or `~/.artcraft-apk`) |
-| `--output DIR` | Where the finished APK is saved (default: `./output`) |
-| `--webgl` | Start the app with `?webgl` to force the WebGL2 fallback (PhotoCraft) |
-| `--block-network` | Strictly offline: block every request that is not bundled in the APK |
-| `--debug-webview` | Allow inspecting the app from `chrome://inspect` on a computer |
-| `--generate-only` | Only write the Android Studio project; don't install tools or build |
-| `--keep-project` | Keep the generated Android project after building |
-
-Setting a `GITHUB_TOKEN` environment variable raises GitHub's API rate limit, but is not required.
+| `--yes`, `-y` | Don't ask for confirmation before downloading |
+| `--main` | Build the newest development code instead of the latest release |
+| `--ref REF` | Build a specific tag, branch or commit of the app |
+| `--debug` | Build a debug APK (larger and slower) |
+| `--appname NAME` | Override the app's display name |
+| `--packagename PKG` | Override the Android package name (default `com.artcraft.<app>`) |
+| `--appicon FILE.png` | Use your own launcher icon |
+| `--cache DIR` | Where tools and build files are saved (default `$ARTCRAFT_APK_HOME` or `~/.artcraft-apk`) |
+| `--output DIR` | Where the finished APK is saved (default `./output`) |
+| `--setup-only` | Install the tools and fetch the source, but don't build |
+| `--fresh` | Always re-download the app source |
+| `--builder-ref REF` | Use a different commit/branch/tag of the builder (default: the reviewed pin; `main` follows its newest changes) |
+| `--builder-path DIR` | Use a local checkout of the builder |
 
 ### Examples
 
 ```bash
 python3 artcraft_apk.py --list
-python3 artcraft_apk.py --app vectorcraft --yes
-python3 artcraft_apk.py --app photocraft --webgl
-python3 artcraft_apk.py --app pdfcraft --block-network
-python3 artcraft_apk.py --app photocraft --generate-only   # open in Android Studio
-python3 artcraft_apk.py --app photocraft --cache /mnt/tools/artcraft-cache
+python3 artcraft_apk.py --app pdfcraft --yes
+python3 artcraft_apk.py --app photocraft --main
+python3 artcraft_apk.py --app photocraft --appname "My Editor" --packagename com.me.editor
+python3 artcraft_apk.py --app vectorcraft --setup-only
 ```
 
-## Installing the APK on your phone
+## Installing the APK
 
 - **Copy the file** to your phone, open it, and allow "install unknown apps" for your file manager or browser when asked; or
 - **Use a USB cable** with USB debugging enabled:
 
   ```bash
-  adb install -r output/PhotoCraft-0.9.0.apk
+  adb install -r output/photocraft-0.10.0.apk
   ```
-
-The APK works on **Android 7.0 (API 24) or newer**.
 
 ## How it works
 
-1. Reads the table of Crafting Apps from the PhotoCraft README (falls back to the GitHub API, then to a built-in list).
+1. Downloads the builder (a small archive, pinned to a reviewed commit) and reads the list of supported apps from it, with descriptions from the PhotoCraft README.
 2. You choose an app.
-3. Finds the newest release containing a web build and downloads it, verifying SHA-256.
-4. Detects the JDK, SDK and Gradle, warns about anything it must download, then installs it.
-5. Generates a minimal Android project: one activity hosting a `WebView`. The web files are bundled as assets and served from a virtual `https://appassets.androidplatform.net/` origin, which gives the app a secure context for WebGPU and the clipboard.
-6. Builds a release APK with Gradle and signs it with a local key.
-
-The shell also handles opening files from your phone, saving exports to Downloads, hardware back-button protection (press twice to exit, since the web apps have no autosave) and keeping the app from reloading on rotation.
+3. Finds the app's newest release tag with `git ls-remote` (no GitHub API, so no rate limit) and reads the Rust version it needs.
+4. Detects the tools, warns about anything missing, and installs it after you confirm.
+5. Downloads that version's source from `github.com/storytold/<app>`.
+6. Runs the builder, which generates an Android launcher for the app, compiles it with the Android NDK, packages it with `cargo-apk2` and signs it.
+7. Copies the finished APK to `./output/`.
 
 ## Signing key
 
-APKs are signed with a key generated on first use and stored at `<cache>/signing/artcraft-release.keystore` (password `artcraft`). This is suitable for **personal use**, not for publishing to Google Play.
-
-**Keep this key.** Android only installs an update over an existing app if both APKs were signed with the same key. If you lose it, uninstall the old app before installing a new build.
+APKs are signed with a key generated on first use, stored at `<cache>/native/keys/artcraft-builder.jks`. It is suitable for **personal use**, not for Google Play. **Keep it**: Android only installs an update over an existing app if both builds used the same key.
 
 ## Troubleshooting
 
-**The app opens but the screen is blank or shows an error.**
-The apps need WebGPU or WebGL2 in Android's WebView. Update *Android System WebView* and *Chrome* from the Play Store, then try rebuilding with `--webgl`. Add `--debug-webview` and open `chrome://inspect` on a computer to see the console.
+**The build fails.**
+Read the build log (the script prints its path). Then try, in order:
+- `--main` (a release can be older than the builder expects),
+- `--builder-ref main` (the builder may have been fixed since the pinned version),
+- freeing disk space (15 GB) or memory (8 GB).
 
-**The Gradle build fails.**
-Common causes: no access to `dl.google.com`, `maven.google.com` or `repo.maven.apache.org` (check your network or proxy settings); too little RAM or disk space; or ARM Linux, where Google's Android build tools may not run. The generated project is kept so you can inspect it.
+**"Missing system packages."**
+Install `git` and a C compiler, then run again: `sudo apt install git build-essential`.
 
-**"No release with a web build."**
-That app has not published a `*-web-*.zip` yet, and only apps that do can be wrapped.
+**"Rust ... is installed but the app needs ... or newer."**
+The newest stable Rust is older than what the app requires. Run `rustup update stable` (or delete the `rust` folder in the cache so a fresh one is installed) and try again, or build an older release with `--ref`.
 
-**GitHub API rate limit.**
-The script automatically falls back to public release pages. You can also set `GITHUB_TOKEN`.
+**It's slow.**
+The first build of each app compiles hundreds of Rust crates. Build output is kept in `<cache>/native/build`, so later builds of the same app are much faster.
 
-**An old Java is found.**
-Only JDK 17-21 with `javac`, `keytool` and `jlink` is accepted. Anything else is ignored and a suitable JDK is downloaded into the cache.
+**cargo-apk2 won't install.**
+Install `pkg-config` and `libssl-dev`, then run again.
 
 ## Limitations
 
-- Performance depends on your phone. Large documents and heavy apps such as FilmCraft and EffectCraft may hit browser memory limits on a phone, and the apps are desktop-style, so a tablet works best.
-- The ArtCraft apps are early software, and their web builds may change layout between versions.
-- Web app features that depend on a desktop (CLI, MCP server, local control channel) are not available in a browser build.
+- **Linux x86-64 only** (or WSL2 on Windows), because the Android NDK and the underlying builder are.
+- **arm64 devices only.**
+- The ArtCraft apps are early software, and their desktop-style interfaces are not designed for phones, so a tablet or a stylus works best. Native Android features (file picker, keyboard, fonts) are provided by the builder and may be incomplete per app.
+- Release versions are built from tags; `main` has newer features but can occasionally fail to compile.
 - The signing key is for personal use only.
 
-##License
+The ArtCraft apps themselves are separate projects with their own licenses (PhotoCraft, for example, is MIT OR Apache-2.0). Check each app's repository before redistributing any APK.
 
-This project is licensed under the MIT License. See the LICENSE file.
+## License
 
-The ArtCraft apps themselves are separate projects with their own licenses. PhotoCraft, for example, is dual-licensed under MIT or Apache-2.0. This script downloads and bundles their official release files unmodified; check each app's repository for its license and trademark terms before redistributing any APK.
+This project is licensed under the MIT License. See the `LICENSE` file.
